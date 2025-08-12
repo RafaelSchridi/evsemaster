@@ -1,0 +1,26 @@
+[project]
+name = "evsemaster"
+version = "0.1.0"
+description = "Python Implimentation of the EVSEMaster App"
+authors = [
+    {name = "Rafaël Schridi",email = "rafael@schridi.nl"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.13.2"
+dependencies = [
+    "pydantic (>=2.10.0,<3.0.0)",
+    "tzdata (>=2025.1,<2026.0)"
+]
+
+[tool.poetry]
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.12.8"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120

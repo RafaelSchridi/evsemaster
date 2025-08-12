@@ -1,0 +1,9 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Virtual environment
+.venv/
+# Since this is supposed to be a package we don't want to force versions
+poetry.lock
