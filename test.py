@@ -111,17 +111,6 @@ async def command_input_loop(protocol: SimpleEVSEProtocol):
             print(f"Failed to send {enum_cmd}: {e}")
 
 
-def callback_handler(event_type: str, data: any):
-    """Example callback handler for events."""
-    return  # ignore for this script
-    if event_type == "status_update":
-        print(f"Status update received: {data}")
-    elif event_type == "charging_status_update":
-        print(f"Charging status update received: {data}")
-    else:
-        print(f"Unhandled event type: {event_type} with data: {data}")
-
-
 async def test_get_data():
     """Test EVSE data retrieval functionality."""
     if len(sys.argv) < 3:
@@ -133,11 +122,7 @@ async def test_get_data():
 
     print(f"Testing EVSE data retrieval for {host}")
 
-    protocol = SimpleEVSEProtocol(
-        host,
-        password,
-        callback_handler,
-    )
+    protocol = SimpleEVSEProtocol(host, password)
 
     status_task = None
     try:

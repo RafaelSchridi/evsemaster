@@ -2,9 +2,17 @@ from dataclasses import dataclass, field
 from struct import unpack
 import logging
 from enum import IntEnum
-import datetime
+from datetime import datetime
+from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
+
+
+class BaseSchema(BaseModel):
+    """Base schema for all data types."""
+
+    class Config:
+        str_strip_whitespace = True
 
 
 class CommandEnum(IntEnum):
@@ -68,7 +76,7 @@ class CommandEnum(IntEnum):
     PASSWORD_ERROR_RESPONSE = 341
 
 
-class GunStateEnum(IntEnum):
+class PlugStateEnum(IntEnum):
     DISCONNECTED = 1
     CONNECTED_UNLOCKED = 2
     CONNECTED_LOCKED = 4
@@ -88,8 +96,7 @@ class CurrentStateEnum(IntEnum):
     CHARGING_RESERVATION = 20
 
 
-@dataclass
-class EvseDeviceInfo:
+class EvseDeviceInfo(BaseSchema):
     type: int
     brand: str
     model: str
@@ -98,41 +105,39 @@ class EvseDeviceInfo:
     max_amps: int
 
 
-@dataclass
-class EvseStatus:
+class EvseStatus(BaseSchema):
     line_id: int  # no idea what this is, but its in the data
     inner_temperature: float
     outer_temperature: float
     emergency_stop: bool
-    gun_state: GunStateEnum
+    plug_state: PlugStateEnum
     output_state: int
     current_state: CurrentStateEnum
     errors: int
-    l1_voltage: float = field(default=0.0)
-    l1_amps: float = field(default=0.0)
-    l2_voltage: float = field(default=0.0)
-    l2_amps: float = field(default=0.0)
-    l3_voltage: float = field(default=0.0)
-    l3_amps: float = field(default=0.0)
-    total_power: int = field(default=0)
-    total_kwh: int = field(default=0)
-    timestamp: datetime = field(default_factory=datetime.datetime.now)
+    l1_voltage: float = Field(default=0.0)
+    l1_amps: float = Field(default=0.0)
+    l2_voltage: float = Field(default=0.0)
+    l2_amps: float = Field(default=0.0)
+    l3_voltage: float = Field(default=0.0)
+    l3_amps: float = Field(default=0.0)
+    current_power: int = Field(default=0)
+    total_kwh: float = Field(default=0)
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 
-@dataclass
-class ChargingStatus:
+class ChargingStatus(BaseSchema):
     line_id: int
-    current_state: int
+    current_state: CurrentStateEnum
     charge_id: str
     start_type: int
     charge_type: int
-    max_duration_minutes: int | None
-    max_energy_kwh: float | None
-    charge_param3: float | None
-    reservation_date: str
+    max_duration_minutes: int | None = None
+    max_energy_kwh: float | None = None
+    charge_param3: float | None = None
+    reservation_date: datetime
     user_id: str
     max_electricity: int
-    start_date: str
+    start_date: datetime
     duration_seconds: int
     start_kwh_counter: float
     current_kwh_counter: float
@@ -140,7 +145,7 @@ class ChargingStatus:
     charge_price: float
     fee_type: int
     charge_fee: float
-    timestamp: datetime = field(default_factory=datetime.datetime.now)
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class DataPacket:

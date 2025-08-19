@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 import asyncio
 import zoneinfo
-from evsemaster.data_types import CommandEnum, DataPacket, EvseDeviceInfo, EvseStatus, ChargingStatus, CurrentStateEnum
+from .data_types import CommandEnum, DataPacket, EvseDeviceInfo, EvseStatus, ChargingStatus, CurrentStateEnum
 
 log = logging.getLogger(__name__)
 
@@ -15,15 +15,15 @@ log = logging.getLogger(__name__)
 class SimpleEVSEProtocol:
     """Simple implementation of EVSE protocol for HA integration."""
 
-    def __init__(self, host: str, password: str, event_callback: callable):
+    def __init__(self, host: str, password: str, event_callback: callable = None):
         """Initialize protocol handler."""
         self.host = host
         self.password = password
-        self.event_callback = event_callback  # Callback for handling events
+        self._event_callback = event_callback
         self.listen_port = 28376  # Port to listen for incoming datagrams
         self.send_port = 7248  # Default port to send to (will be updated by discovery)
         self.serial_number = "00000000"  # Placeholder for device serial number
-        self.user_id = "evsemaster_python"  # Default user ID
+        self.user_id = "evsemaster_python"  # Do all actions as this "user"
         self._listen_socket: Optional[socket.socket] = None
         self._send_socket: Optional[socket.socket] = None
         self._logged_in = False
@@ -79,6 +79,10 @@ class SimpleEVSEProtocol:
 
     async def login(self) -> bool:
         """Login to EVSE."""
+        if self._logged_in:
+            log.info("Already logged in to EVSE,reconnecting")
+            await self.disconnect()
+
         if not self._send_socket or not self._listen_socket:
             if not await self.connect():
                 return False
@@ -115,6 +119,14 @@ class SimpleEVSEProtocol:
             log.exception("Failed to login: %s", err)
             return False
 
+    def send_event(self, event_type: str, data: Any):
+        """Handle events from the EVSE."""
+        if self._event_callback:
+            try:
+                self._event_callback(event_type, data)
+            except Exception as e:
+                log.error(f"Error in event callback: {e}")
+
     async def listener_loop(self):
         """Run the listener loop to handle incoming datagrams."""
         if not self._listen_socket:
@@ -136,8 +148,7 @@ class SimpleEVSEProtocol:
                     case CommandEnum.NOT_LOGGED_IN_EVENT:
                         # not logged in, try to login
                         self._logged_in = False
-                        log.warning("Received LOGIN command, not logged in, attempting to login")
-                        await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
+                        log.warning("Logged out by EVSE.")
                     case CommandEnum.LOGIN_SUCCESS_EVENT:
                         # Handle login response
                         if self._parse_login_response(data_packet):
@@ -147,10 +158,10 @@ class SimpleEVSEProtocol:
                         log.debug(self._parse_status_response(data_packet))
                         # Do we need to send a response?
                         await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_RESPONSE))
-                        self.event_callback("status_update", self._status)
+                        self.send_event(EvseStatus.__name__, self._status)
                     case CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
                         log.debug(self._parse_ac_charging_status(data_packet))
-                        self.event_callback("charging_status_update", self._charging_status)
+                        self.send_event(ChargingStatus.__name__, self._charging_status)
                     case CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD:
                         pass
                     case _:
@@ -204,15 +215,16 @@ class SimpleEVSEProtocol:
     async def request_status(self) -> Dict[str, Any]:
         """Get EVSE status."""
         if not self._logged_in or not self._send_socket:
-            return {}
+            return False
 
         try:
             # Send status request
             await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
-
+            return True
+        
         except Exception as err:
             log.error("Failed to get status: %s", err)
-            return {}
+            return False
 
     async def start_charging(
         self, max_amps: int = 16, start_date: datetime = datetime.now(), duration_minutes: int = 65535
@@ -362,12 +374,12 @@ class SimpleEVSEProtocol:
                 line_id=data.get_int(0, 1),
                 l1_voltage=data.get_int(1, 2) / 10,
                 l1_amps=data.get_int(3, 2) / 100,
-                total_power=data.get_int(5, 4),
+                current_power=data.get_int(5, 4),
                 total_kwh=data.get_int(9, 4) / 100,
                 inner_temperature=data.read_temperature(13),
                 outer_temperature=data.read_temperature(15),
                 emergency_stop=data.get_int(17, 1),
-                gun_state=data.get_int(18, 1),
+                plug_state=data.get_int(18, 1),
                 output_state=data.get_int(19, 1),
                 current_state=data.get_int(20, 1),
                 errors=data.get_int(21, 4),
