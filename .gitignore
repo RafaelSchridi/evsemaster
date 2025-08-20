@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 # Since this is supposed to be a package we don't want to force versions
 poetry.lock
+
+# Distribution / packaging
+dist/
