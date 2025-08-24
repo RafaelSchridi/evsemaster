@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 from struct import unpack
 import logging
 from enum import IntEnum
@@ -97,12 +96,13 @@ class CurrentStateEnum(IntEnum):
 
 
 class EvseDeviceInfo(BaseSchema):
-    type: int
-    brand: str
-    model: str
-    hardware_version: str
-    max_power: int
-    max_amps: int
+    type: int = Field(default=0)
+    brand: str = Field(default="Brand")
+    model: str = Field(default="Model")
+    hardware_version: str = Field(default="0.0")
+    max_power: int = Field(default=0)
+    max_amps: int = Field(default=0)
+    serial_number: str = Field(default="00000000")  # 8 byte hex string
 
 
 class EvseStatus(BaseSchema):
@@ -163,8 +163,6 @@ class DataPacket:
         self.command: CommandEnum = CommandEnum(unpack(">H", data[19:21])[0])
         if self.command not in CommandEnum:
             raise ValueError(f"Unknown command: {self.command}")
-        # how its done in TS:
-        # this.deviceSerial = buffer.toString("hex", 5, 13);
         self.device_serial = data[5:13].hex()  # Device serial number
         self.data = data[21:]  # drop all bytes before the data section
         log.debug(self.__repr__())

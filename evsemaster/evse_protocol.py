@@ -2,14 +2,32 @@
 
 import logging
 import struct
-import socket
-from typing import Dict, Any, Optional
+from typing import Any, Optional
 from datetime import datetime
 import asyncio
 import zoneinfo
 from .data_types import CommandEnum, DataPacket, EvseDeviceInfo, EvseStatus, ChargingStatus, CurrentStateEnum
 
 log = logging.getLogger(__name__)
+
+
+class _EVSEDatagramProtocol(asyncio.DatagramProtocol):
+    def __init__(self, parent: "SimpleEVSEProtocol"):
+        self.parent = parent
+
+    def datagram_received(self, data: bytes, addr):  # type: ignore[override]
+        try:
+            asyncio.create_task(self.parent._on_datagram(data, addr))
+        except Exception as e:
+            log.error(f"Datagram handling error: {e}")
+
+    def error_received(self, exc):  # type: ignore[override]
+        log.error(f"Datagram error received: {exc}")
+
+    def connection_lost(self, exc):  # type: ignore[override]
+        log.info("Datagram connection lost")
+        self.parent._logged_in = False
+        self.parent._transport = None
 
 
 class SimpleEVSEProtocol:
@@ -22,102 +40,75 @@ class SimpleEVSEProtocol:
         self._event_callback = event_callback
         self.listen_port = 28376  # Port to listen for incoming datagrams
         self.send_port = 7248  # Default port to send to (will be updated by discovery)
-        self.serial_number = "00000000"  # Placeholder for device serial number
-        self.user_id = "evsemaster_python"  # Do all actions as this "user"
-        self._listen_socket: Optional[socket.socket] = None
-        self._send_socket: Optional[socket.socket] = None
+        self.user_id = "evsemasterpy"  # Do all actions as this "user"
+        self._transport: Optional[asyncio.DatagramTransport] = None
+        self._login_future: Optional[asyncio.Future] = None
+        self._pending: dict[str, asyncio.Future] = {}
         self._logged_in = False
+        self._login_attempts = 0
         self._status: Optional[EvseStatus] = None
         self._device_info: Optional[EvseDeviceInfo] = None
         self._charging_status: Optional[ChargingStatus] = None
         self._discovery_running = False
 
     async def send_packet(self, data: bytes):
-        """Send a packet to the EVSE."""
-        if not self._send_socket:
-            log.error("Send socket is not initialized")
+        if not self._transport:
+            log.error("Transport not ready")
             return
-
         try:
-            self._send_socket.sendto(data, (self.host, self.send_port))
+            self._transport.sendto(data, (self.host, self.send_port))
         except Exception as e:
-            log.error("Failed to send packet: %s", e)
+            log.error(f"Failed to send packet: {e}")
 
     async def connect(self) -> bool:
-        """Connect to EVSE and start discovery."""
+        """Create datagram endpoint and prepare transport."""
         try:
-            # Create listen socket for receiving datagrams from EVSE
-            self._listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._listen_socket.bind(("0.0.0.0", self.listen_port))
-            self._listen_socket.settimeout(10.0)
-
-            # Create send socket for sending commands to EVSE
-            self._send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._send_socket.settimeout(10.0)
-
-            log.info(
-                "Connected to EVSE at %s, listening on port %d",
-                self.host,
-                self.listen_port,
+            loop = asyncio.get_running_loop()
+            self._transport, protocol = await loop.create_datagram_endpoint(
+                lambda: _EVSEDatagramProtocol(self), local_addr=("0.0.0.0", self.listen_port)
             )
+            log.info("Datagram endpoint ready (listening %s:%d)", "0.0.0.0", self.listen_port)
             return True
         except Exception as err:
-            log.error("Failed to connect: %s", err)
+            log.error(f"Failed to create datagram endpoint: {err}")
             return False
 
     async def disconnect(self):
-        """Disconnect from EVSE."""
-        self._discovery_running = False
-        if self._listen_socket:
-            self._listen_socket.close()
-            self._listen_socket = None
-        if self._send_socket:
-            self._send_socket.close()
-            self._send_socket = None
+        """Close transport."""
+        if self._transport:
+            self._transport.close()
+            self._transport = None
         self._logged_in = False
+        self._login_future = None
+        self._pending.clear()
 
     async def login(self) -> bool:
-        """Login to EVSE."""
         if self._logged_in:
-            log.info("Already logged in to EVSE,reconnecting")
             await self.disconnect()
-
-        if not self._send_socket or not self._listen_socket:
+        if not self._transport:
             if not await self.connect():
                 return False
-
+        # Prepare future
+        loop = asyncio.get_running_loop()
+        self._login_future = loop.create_future()
         try:
-            # Start discovery to find the correct port
-            await self._discover_evse_port()
-
+            # as first action we probe to get a response/port number
             await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
-
-            # Try to receive response
-            try:
-                data, addr = self._listen_socket.recvfrom(1024)
-                packet = DataPacket(data)  # Parse incoming data packet
-                if self._parse_login_response(packet):
-                    # If login response is successful, send confirm
-                    await self.send_packet(self._build_packet(CommandEnum.LOGIN_CONFIRM_RESPONSE))
-                    data, addr = self._listen_socket.recvfrom(1024)
-                    data_packet = DataPacket(data)  # Parse confirm response
-                    self._parse_login_response(data_packet)
-                    self._logged_in = True
-                    if data_packet.device_serial:
-                        self.serial_number = data_packet.device_serial
-                    log.info("Login successful")
-                    # Start listener loop in background
-                    asyncio.create_task(self.listener_loop())
-                    return True
-            except socket.timeout:
-                log.warning("Login timeout")
-
+            # wait for a short moment for transport setup and response from above
+            await asyncio.sleep(2)
+            await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
+            # Wait for LOGIN_SUCCESS_EVENT (set in _on_datagram)
+            await asyncio.wait_for(self._login_future, timeout=10)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("Login timeout")
             return False
-
-        except Exception as err:
-            log.exception("Failed to login: %s", err)
+        except Exception as e:
+            log.error(f"Login failed: {e}")
             return False
+        finally:
+            if self._login_future and not self._login_future.done():
+                self._login_future.cancel()
 
     def send_event(self, event_type: str, data: Any):
         """Handle events from the EVSE."""
@@ -127,112 +118,81 @@ class SimpleEVSEProtocol:
             except Exception as e:
                 log.error(f"Error in event callback: {e}")
 
-    async def listener_loop(self):
-        """Run the listener loop to handle incoming datagrams."""
-        if not self._listen_socket:
-            return
-
-        log.info("Starting listener loop on port %d", self.listen_port)
-        while self._logged_in:
-            try:
-                data, addr = self._listen_socket.recvfrom(1024)
-                try:
-                    data_packet = DataPacket(data)  # Parse incoming data packet and slices the preamble
-                except ValueError as e:
-                    log.error(f"Invalid data packet received: {e}")
-                    continue
-                match data_packet.command:
-                    case CommandEnum.HEADING_EVENT:
-                        # response to keepalive, need to send back HEADING_RESPONSE
-                        await self.send_packet(self._build_packet(CommandEnum.HEADING_RESPONSE))
-                    case CommandEnum.NOT_LOGGED_IN_EVENT:
-                        # not logged in, try to login
-                        self._logged_in = False
-                        log.warning("Logged out by EVSE.")
-                    case CommandEnum.LOGIN_SUCCESS_EVENT:
-                        # Handle login response
-                        if self._parse_login_response(data_packet):
-                            log.info("Login response received, sending confirm")
-                            await self.send_packet(self._build_packet(CommandEnum.LOGIN_CONFIRM_RESPONSE))
-                    case CommandEnum.CURRENT_STATUS_EVENT:
-                        log.debug(self._parse_status_response(data_packet))
-                        # Do we need to send a response?
-                        await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_RESPONSE))
-                        self.send_event(EvseStatus.__name__, self._status)
-                    case CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
-                        log.debug(self._parse_ac_charging_status(data_packet))
-                        self.send_event(ChargingStatus.__name__, self._charging_status)
-                    case CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD:
-                        pass
-                    case _:
-                        log.warning("Unhandled command: %s", data_packet.command.name)
-                await asyncio.sleep(0.1)  # Avoid busy loop
-            except socket.timeout:
-                log.warning("Listener socket timeout, retrying...")
-                continue
-                await asyncio.sleep(1)  # Give the system some time to recover
-            except Exception as e:
-                log.error(f"Listener loop error: {e}, restarting.")
-                await asyncio.sleep(1)  # Give the system some time to recover
-                continue
-
-    async def _discover_evse_port(self) -> bool:
-        """Discover EVSE port by listening for incoming datagrams."""
-        if not self._listen_socket:
-            return False
-
-        log.info("Starting EVSE port discovery on %s", self.host)
-
-        # Send a discovery packet to the default port to trigger a response
-        discovery_packet = self._build_packet(CommandEnum.LOGIN_REQUEST)
-        if self._send_socket:
-            self._send_socket.sendto(discovery_packet, (self.host, self.send_port))
-
-        # Listen for any incoming datagram from our target EVSE
-        for _ in range(5):  # Try for up to 5 attempts
-            try:
-                data, addr = self._listen_socket.recvfrom(1024)
-                if addr[0] == self.host:
-                    # Found a datagram from our EVSE, update the port
-                    discovered_port = addr[1]
-                    if discovered_port != self.send_port:
-                        log.info(
-                            "Discovered EVSE port: %d (was using %d)",
-                            discovered_port,
-                            self.send_port,
-                        )
-                        self.send_port = discovered_port
-                    return True
-            except socket.timeout:
-                # Try sending another discovery packet
-                if self._send_socket:
-                    self._send_socket.sendto(discovery_packet, (self.host, self.send_port))
-                continue
-
-        log.warning("Could not discover EVSE port, using default %d", self.send_port)
-        return False
-
-    async def request_status(self) -> Dict[str, Any]:
-        """Get EVSE status."""
-        if not self._logged_in or not self._send_socket:
-            return False
-
+    async def _on_datagram(self, data: bytes, addr):
+        # Adjust discovered port if needed
+        if addr[0] == self.host and addr[1] != self.send_port:
+            log.debug(f"Discovered/updated EVSE port {addr[1]} (was {self.send_port})")
+            self.send_port = addr[1]
         try:
-            # Send status request
+            packet = DataPacket(data)
+        except ValueError as e:
+            log.error(f"Invalid data packet received: {e}")
+            return
+        cmd = packet.command
+        # Handle login success
+        if cmd == CommandEnum.LOGIN_SUCCESS_EVENT:
+            self._parse_device_info(packet)
+            await self.send_packet(self._build_packet(CommandEnum.LOGIN_CONFIRM_RESPONSE))
+            if self._login_future and not self._login_future.done():
+                self._login_future.set_result(True)
+            self._logged_in = True
+        elif cmd == CommandEnum.PASSWORD_ERROR_EVENT:
+            self._logged_in = False
+            # try to re-login
+            if self._login_future and not self._login_future.done():
+                self._login_future.set_result(False)
+            log.error("Password error")
+            return
+        elif cmd == CommandEnum.HEADING_EVENT:
+            # Keepalive response
+            asyncio.create_task(self.send_packet(self._build_packet(CommandEnum.HEADING_RESPONSE)))
+        elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
+            log.debug(self._parse_status_response(packet))
+            asyncio.create_task(self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_RESPONSE)))
+            self.send_event(EvseStatus.__name__, self._status)
+        elif cmd == CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
+            log.debug(self._parse_ac_charging_status(packet))
+            self.send_event(ChargingStatus.__name__, self._charging_status)
+        elif cmd == CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD:
+            pass
+        elif cmd == CommandEnum.NOT_LOGGED_IN_EVENT:
+            # After sending a LOGIN_CONFIRM_RESPONSE we get one of these.
+            # so we can ignore the first few
+            self._login_attempts += 1
+            if self._login_attempts > 3:
+                log.warning("Received too many NOT_LOGGED_IN_EVENT, marking as logged out")
+                self._logged_in = False
+        else:
+            log.debug(f"Unhandled command: {cmd.name}")
+        if cmd != CommandEnum.NOT_LOGGED_IN_EVENT:
+            # reset login attempts on any valid command
+            self._login_attempts = 0
+
+    async def request_status(self) -> bool:
+        """Request current EVSE status (async)."""
+        if not self._logged_in:
+            return False
+        try:
             await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
             return True
-        
-        except Exception as err:
-            log.error("Failed to get status: %s", err)
+        except Exception as e:
+            log.error(f"Failed to request status: {e}")
             return False
 
     async def start_charging(
-        self, max_amps: int = 16, start_date: datetime = datetime.now(), duration_minutes: int = 65535
+        self,
+        max_amps: int = 16,
+        start_date: datetime = datetime.now(),
+        duration_minutes: int = 65535,
     ) -> bool:
-        """Start charging."""
-        if not self._logged_in or not self._send_socket:
-            return False
+        """Send start charging request.
 
+        max_amps: limit current
+        start_date: schedule start (now if None)
+        duration_minutes: max duration (65535 = unlimited)
+        """
+        if not self._logged_in:
+            return False
         try:
             if self._status and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION:
                 log.warning("Start charge send while a reservation is active, cancelling reservation first")
@@ -264,40 +224,31 @@ class SimpleEVSEProtocol:
 
             packet = self._build_packet(CommandEnum.CHARGE_START_REQUEST, extra_payload)
             await self.send_packet(packet)
-            log.info("Sent charge start command")
             return True
-        except Exception as err:
-            log.error("Failed to start charging: %s", err)
+        except Exception as e:
+            log.error(f"Failed to start charging: {e}")
+            return False
+
+    async def stop_charging(self) -> bool:
+        """Send stop charging request."""
+        if not self._logged_in:
+            return False
+        try:
+            extra_payload = bytes([1])  # port id
+            await self.send_packet(self._build_packet(CommandEnum.CHARGE_STOP_REQUEST, extra_payload))
+            return True
+        except Exception as e:
+            log.error(f"Failed to stop charging: {e}")
             return False
 
     def _datetime_to_shanghai_epoch(self, dt: datetime) -> int:
-        """
-        Convert datetime to Shanghai timestamp.
-        """
-        log.debug(f"Converting time {dt.timestamp()} in {dt.tzinfo} to Shanghai epoch")
+        """Convert datetime to Asia/Shanghai epoch seconds."""
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=shanghai_tz)
-        elif dt.tzinfo.zone != "Asia/Shanghai":
+        else:
             dt = dt.astimezone(shanghai_tz)
-        log.debug(f"Converted time is now {dt.timestamp()} in {dt.tzinfo}")
         return int(dt.timestamp())
-
-    async def stop_charging(self) -> bool:
-        """Stop charging."""
-        if not self._logged_in or not self._send_socket:
-            return False
-
-        try:
-            extra_payload = bytearray(1)  # Extra payload for charge stop
-            extra_payload[0] = 1  # Port to stop charging on
-            packet = self._build_packet(CommandEnum.CHARGE_STOP_REQUEST, extra_payload)
-            await self.send_packet(packet)
-            log.info("Sent charge stop command")
-            return True
-        except Exception as err:
-            log.error("Failed to stop charging: %s", err)
-            return False
 
     def _build_packet(self, cmd: CommandEnum, payload: bytes = b"") -> bytes:
         """Generic method to build a packet with given command and payload."""
@@ -325,26 +276,8 @@ class SimpleEVSEProtocol:
         struct.pack_into(">H", packet, len(packet) - 4, checksum)
         # Tail (0x0f02)
         struct.pack_into(">H", packet, len(packet) - 2, 0x0F02)
-
+        log.debug(f"Built packet: cmd={cmd.name}, len={len(packet)}")
         return bytes(packet)
-
-    def _parse_login_response(self, data: DataPacket) -> bool:
-        """Parse login response."""
-        try:
-            if data.command == CommandEnum.LOGIN_SUCCESS_EVENT:
-                # Login response - extract device info
-                self._parse_device_info(data)
-                return True
-            elif data.command == CommandEnum.PASSWORD_ERROR_EVENT:
-                # Password error
-                log.error("Password error received")
-                return False
-
-            return False
-
-        except Exception as err:
-            log.error("Failed to parse login response: %s", err)
-            return False
 
     def _parse_device_info(self, data: DataPacket):
         """Parse device information from login response."""
@@ -359,6 +292,7 @@ class SimpleEVSEProtocol:
                 hardware_version=data.get_string(33, 16),
                 max_power=data.get_int(49, 4),
                 max_amps=data.get_int(53, 1),
+                serial_number=data.device_serial,
             )
 
         except Exception as err:

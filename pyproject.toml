@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "evsemaster"
-version = "1.0.0"
+version = "1.1.0"
 description = "Python implementation of the EVSEMaster App"
 authors = [
     "Rafaël Schridi <rafael@schridi.nl>"
