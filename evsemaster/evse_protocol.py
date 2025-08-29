@@ -6,7 +6,15 @@ from typing import Any, Optional
 from datetime import datetime
 import asyncio
 import zoneinfo
-from .data_types import CommandEnum, DataPacket, EvseDeviceInfo, EvseStatus, ChargingStatus, CurrentStateEnum
+from .data_types import (
+    CommandEnum,
+    DataPacket,
+    EvseDeviceInfo,
+    EvseStatus,
+    ChargingStatus,
+    CurrentStateEnum,
+    NotLoggedInError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -97,8 +105,8 @@ class SimpleEVSEProtocol:
             # wait for a short moment for transport setup and response from above
             await asyncio.sleep(2)
             await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
-            # Wait for LOGIN_SUCCESS_EVENT (set in _on_datagram)
             await asyncio.wait_for(self._login_future, timeout=10)
+            await self.request_essentials()
             return True
         except asyncio.TimeoutError:
             log.warning("Login timeout")
@@ -153,8 +161,14 @@ class SimpleEVSEProtocol:
         elif cmd == CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
             log.debug(self._parse_ac_charging_status(packet))
             self.send_event(ChargingStatus.__name__, self._charging_status)
-        elif cmd == CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD:
-            pass
+        elif cmd == CommandEnum.NICKNAME_RESPONSE:
+            nickname = packet.get_string(1, packet.length() - 1)
+            self._device_info.nickname = nickname
+            self.send_event(EvseDeviceInfo.__name__, self._device_info)
+        elif cmd == CommandEnum.OUTPUT_AMPERAGE_REQUEST_RESPONSE:
+            amperage = packet.get_int(1, 1)
+            self._device_info.configured_max_amps = amperage
+            self.send_event(EvseDeviceInfo.__name__, self._device_info)
         elif cmd == CommandEnum.NOT_LOGGED_IN_EVENT:
             # After sending a LOGIN_CONFIRM_RESPONSE we get one of these.
             # so we can ignore the first few
@@ -171,13 +185,18 @@ class SimpleEVSEProtocol:
     async def request_status(self) -> bool:
         """Request current EVSE status (async)."""
         if not self._logged_in:
-            return False
-        try:
-            await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
-            return True
-        except Exception as e:
-            log.error(f"Failed to request status: {e}")
-            return False
+            raise NotLoggedInError("Please login before requesting status")
+        await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
+        return True
+
+    async def request_essentials(self) -> bool:
+        """Send some commands to get basic info."""
+        if not self._logged_in:
+            raise NotLoggedInError("Please login before getting essentials")
+        await self.send_packet(self._build_packet(CommandEnum.NICKNAME_REQUEST, bytes([CommandEnum.GET_ACTION])))
+        await self.send_packet(self._build_packet(CommandEnum.OUTPUT_AMPERAGE_REQUEST, bytes([CommandEnum.GET_ACTION])))
+        await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
+        return True
 
     async def start_charging(
         self,
@@ -192,54 +211,48 @@ class SimpleEVSEProtocol:
         duration_minutes: max duration (65535 = unlimited)
         """
         if not self._logged_in:
-            return False
-        try:
-            if self._status and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION:
-                log.warning("Start charge send while a reservation is active, cancelling reservation first")
-                await self.stop_charging()
-            extra_payload = bytearray(47)
+            raise NotLoggedInError("Please login before starting charge")
 
-            # Line ID (seems to be always one 1, are there any devices with multiple lines?)
-            struct.pack_into(">B", extra_payload, 0, 1)
-            # User ID (16 bytes, ASCII encoded)
-            struct.pack_into(">16s", extra_payload, 1, self.user_id.encode("ascii")[:16])
-            # Charge ID (16 bytes, ASCII encoded)
-            struct.pack_into(">16s", extra_payload, 17, start_date.strftime("%Y%m%d%H%M").encode("ascii")[:16])
-            # Reservation: 0 for now, 1 if future reservation
-            struct.pack_into(">B", extra_payload, 33, 0 if datetime.now() > start_date else 1)
-            # Reservation date (current time in Shanghai epoch)
-            struct.pack_into(">I", extra_payload, 34, self._datetime_to_shanghai_epoch(start_date))
-            # Start type (always 1)
-            struct.pack_into(">B", extra_payload, 38, 1)
-            # Charge type (always 1)
-            struct.pack_into(">B", extra_payload, 39, 1)
-            # Max duration (65535 = highest possible, unlimited)
-            struct.pack_into(">H", extra_payload, 40, duration_minutes)
-            # Max energy (65535 = highest possible, unlimited)
-            struct.pack_into(">H", extra_payload, 42, 65535)
-            # Charge param 3 (always 65535)
-            struct.pack_into(">H", extra_payload, 44, 65535)
-            # Max electricity in amps
-            struct.pack_into(">B", extra_payload, 46, max_amps)
+        if self._status and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION:
+            log.warning("Start charge send while a reservation is active, cancelling reservation first")
+            await self.stop_charging()
+        extra_payload = bytearray(47)
 
-            packet = self._build_packet(CommandEnum.CHARGE_START_REQUEST, extra_payload)
-            await self.send_packet(packet)
-            return True
-        except Exception as e:
-            log.error(f"Failed to start charging: {e}")
-            return False
+        # Line ID (seems to be always one 1, are there any devices with multiple lines?)
+        struct.pack_into(">B", extra_payload, 0, 1)
+        # User ID (16 bytes, ASCII encoded)
+        struct.pack_into(">16s", extra_payload, 1, self.user_id.encode("ascii")[:16])
+        # Charge ID (16 bytes, ASCII encoded)
+        struct.pack_into(">16s", extra_payload, 17, start_date.strftime("%Y%m%d%H%M").encode("ascii")[:16])
+        # Reservation: 0 for now, 1 if future reservation
+        struct.pack_into(">B", extra_payload, 33, 0 if datetime.now() > start_date else 1)
+        # Reservation date (current time in Shanghai epoch)
+        struct.pack_into(">I", extra_payload, 34, self._datetime_to_shanghai_epoch(start_date))
+        # Start type (always 1)
+        struct.pack_into(">B", extra_payload, 38, 1)
+        # Charge type (always 1)
+        struct.pack_into(">B", extra_payload, 39, 1)
+        # Max duration (65535 = highest possible, unlimited)
+        struct.pack_into(">H", extra_payload, 40, duration_minutes)
+        # Max energy (65535 = highest possible, unlimited)
+        struct.pack_into(">H", extra_payload, 42, 65535)
+        # Charge param 3 (always 65535)
+        struct.pack_into(">H", extra_payload, 44, 65535)
+        # Max electricity in amps
+        struct.pack_into(">B", extra_payload, 46, max_amps)
+
+        packet = self._build_packet(CommandEnum.CHARGE_START_REQUEST, extra_payload)
+        await self.send_packet(packet)
+        return True
 
     async def stop_charging(self) -> bool:
         """Send stop charging request."""
         if not self._logged_in:
-            return False
-        try:
-            extra_payload = bytes([1])  # port id
-            await self.send_packet(self._build_packet(CommandEnum.CHARGE_STOP_REQUEST, extra_payload))
-            return True
-        except Exception as e:
-            log.error(f"Failed to stop charging: {e}")
-            return False
+            raise NotLoggedInError("Please login before stopping charge")
+
+        extra_payload = bytes([1])  # port id
+        await self.send_packet(self._build_packet(CommandEnum.CHARGE_STOP_REQUEST, extra_payload))
+        return True
 
     def _datetime_to_shanghai_epoch(self, dt: datetime) -> int:
         """Convert datetime to Asia/Shanghai epoch seconds."""
@@ -249,6 +262,38 @@ class SimpleEVSEProtocol:
         else:
             dt = dt.astimezone(shanghai_tz)
         return int(dt.timestamp())
+
+    async def set_nickname(self, nickname: str) -> bool:
+        """Set the EVSE nickname."""
+        if not self._logged_in:
+            raise NotLoggedInError("Please login before setting nickname")
+        if len(nickname) > 32:
+            log.warning("Nickname too long, truncating to 32 characters")
+            nickname = nickname[:32]
+        extra_payload = bytearray(1 + len(nickname))
+        # Action: 0 = set, 1 = get
+        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        # Nickname (up to 20 bytes, ASCII encoded)
+        struct.pack_into(f">{len(nickname)}s", extra_payload, 1, nickname.encode("ascii"))
+        packet = self._build_packet(CommandEnum.NICKNAME_REQUEST, extra_payload)
+        await self.send_packet(packet)
+        return True
+
+    async def set_output_amperage(self, amperage: int) -> bool:
+        """Set the EVSE output amperage limit."""
+        if not self._logged_in:
+            raise NotLoggedInError("Please login before setting output amperage")
+        if amperage < 6 or amperage > 32:
+            raise ValueError("Amperage must be between 6 and 32")
+        if self._device_info and amperage > self._device_info.max_amps:
+            raise ValueError(f"Amperage exceeds device max of {self._device_info.max_amps}")
+        extra_payload = bytearray(3)
+        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        struct.pack_into(">B", extra_payload, 1, amperage)
+
+        packet = self._build_packet(CommandEnum.OUTPUT_AMPERAGE_REQUEST, extra_payload)
+        await self.send_packet(packet)
+        return True
 
     def _build_packet(self, cmd: CommandEnum, payload: bytes = b"") -> bytes:
         """Generic method to build a packet with given command and payload."""

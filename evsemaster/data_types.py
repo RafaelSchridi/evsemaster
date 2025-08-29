@@ -18,7 +18,7 @@ class CommandEnum(IntEnum):
     # request = client-initiated (you send)
     # event = anything incoming (EVSE -> you), whether it’s a reply or unsolicited
     # response = what you send back to an event that requires it
-
+    # login
     NOT_LOGGED_IN_EVENT = 0x0001
     LOGIN_REQUEST = 0x8002
     LOGIN_SUCCESS_EVENT = 0x0002
@@ -41,38 +41,21 @@ class CommandEnum(IntEnum):
     CHARGE_STOP_REQUEST = 0x8008
     CHARGE_STOP_RESPONSE = 0x0008
 
-    #### Haven't touched yet ####
+    # Setters/Getters
+    NICKNAME_REQUEST = 0x8108
+    NICKNAME_RESPONSE = 0x0108
+    OUTPUT_AMPERAGE_REQUEST = 0x8107
+    OUTPUT_AMPERAGE_REQUEST_RESPONSE = 0x0107
 
-    # Charge record commands
-    CURRENT_CHARGE_RECORD = 0x0009
+    # Desired action for set/get commands
+    SET_ACTION = 1
+    GET_ACTION = 2
+
+    #### Haven't touched yet ####s
+    CURRENT_CHARGE_RECORD_REQUEST = 0x800D
+    CURRENT_CHARGE_RECORD_EVENT = 0x0009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
     REQUEST_STATUS_RECORD = 0x000D
-    REQUEST_CHARGE_STATUS_RECORD = 0x800D
-    CURRENT_CHARGE_RECORD_RESPONSE = 0x8009
-
-    # System settings commands
-    SET_AND_GET_SYSTEM_TIME = 33025
-    SET_AND_GET_SYSTEM_TIME_RESPONSE = 257
-    GET_VERSION = 33030
-    GET_VERSION_RESPONSE = 262
-    SET_AND_GET_OUTPUT_ELECTRICITY = 33031
-    SET_AND_GET_OUTPUT_ELECTRICITY_RESPONSE = 263
-    SET_AND_GET_NICK_NAME = 33032
-    SET_AND_GET_NICK_NAME_RESPONSE = 264
-    SET_AND_GET_OFF_LINE_CHARGE = 33037
-    SET_AND_GET_OFF_LINE_CHARGE_RESPONSE = 269
-    SET_AND_GET_LANGUAGE = 33039
-    SET_AND_GET_LANGUAGE_RESPONSE = 271
-    SET_AND_GET_TEMPERATURE_UNIT = 33042
-    SET_AND_GET_TEMPERATURE_UNIT_RESPONSE = 274
-
-    # Fee and strategy commands
-    SET_AND_GET_CHARGE_FEE_RESPONSE = 0x0104
-    SET_AND_GET_SERVICE_FEE_RESPONSE = 0x0105
-    SET_AND_GET_ALARM_CHARGE_STRATEGY_RESPONSE = 0x010E
-
-    # Error responses
-    PASSWORD_ERROR_RESPONSE = 341
 
 
 class PlugStateEnum(IntEnum):
@@ -101,8 +84,10 @@ class EvseDeviceInfo(BaseSchema):
     model: str = Field(default="Model")
     hardware_version: str = Field(default="0.0")
     max_power: int = Field(default=0)
-    max_amps: int = Field(default=0)
+    max_amps: int = Field(default=16)
     serial_number: str = Field(default="00000000")  # 8 byte hex string
+    nickname: str = Field(default="")
+    configured_max_amps: int = Field(default=16)  # User-configured max amps
 
 
 class EvseStatus(BaseSchema):
@@ -122,7 +107,6 @@ class EvseStatus(BaseSchema):
     l3_amps: float = Field(default=0.0)
     current_power: int = Field(default=0)
     total_kwh: float = Field(default=0)
-    timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class ChargingStatus(BaseSchema):
@@ -145,7 +129,6 @@ class ChargingStatus(BaseSchema):
     charge_price: float
     fee_type: int
     charge_fee: float
-    timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class DataPacket:
@@ -199,3 +182,9 @@ class DataPacket:
         if temp == 0xFFFF:
             return -1.0
         return round((temp - 20000) / 100, 1)
+
+
+class NotLoggedInError(Exception):
+    """Exception raised when an operation is attempted without being logged in."""
+
+    pass
