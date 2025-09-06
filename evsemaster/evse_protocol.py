@@ -268,13 +268,25 @@ class SimpleEVSEProtocol:
         return True
 
     def _datetime_to_shanghai_epoch(self, dt: datetime) -> int:
-        """Convert datetime to Asia/Shanghai epoch seconds."""
+        """
+        The EVSE handles time weirdly, time interpretation is always in Asia/Shanghai timezone.
+        So any time object you give it it will convert to Asia/Shanghai.
+        So we always convert to Asia/Shanghai here.
+        """
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=shanghai_tz)
         else:
             dt = dt.astimezone(shanghai_tz)
         return int(dt.timestamp())
+
+    def _shanghai_epoch_to_datetime(self, epoch: int) -> datetime:
+        """
+        Similarly we receive the time as epoch seconds but always in Asia/Shanghai timezone.
+        """
+        shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
+        dt = datetime.fromtimestamp(epoch).replace(tzinfo=shanghai_tz)
+        return dt
 
     async def set_nickname(self, nickname: str) -> bool:
         """Set the EVSE nickname."""
@@ -416,10 +428,10 @@ class SimpleEVSEProtocol:
                 max_duration_minutes=None if data.get_int(20, 2) == 65535 else data.get_int(20, 2),
                 max_energy_kwh=None if data.get_int(22, 2) == 65535 else data.get_int(22, 2) * 0.01,
                 charge_param3=None if data.get_int(24, 2) == 65535 else data.get_int(24, 2) * 0.01,
-                reservation_date=datetime.fromtimestamp(data.get_int(26, 4)),
+                reservation_datetime=self._shanghai_epoch_to_datetime(data.get_int(26, 4)),
                 user_id=data.get_string(30, 16),
                 max_electricity=data.get_int(46, 1),
-                start_date=datetime.fromtimestamp(data.get_int(47, 4)),
+                set_datetime=self._shanghai_epoch_to_datetime(data.get_int(47, 4)),
                 duration_seconds=data.get_int(51, 4),
                 start_kwh_counter=data.get_int(55, 4) / 100,
                 current_kwh_counter=data.get_int(59, 4) / 100,

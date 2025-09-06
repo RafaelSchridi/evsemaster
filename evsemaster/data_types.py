@@ -62,6 +62,8 @@ class CommandEnum(IntEnum):
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
     REQUEST_STATUS_RECORD = 0x000D
+    POSSIBLE_REPEATED = 270
+    POSSIBLE_TIME = 257
 
 
 class PlugStateEnum(IntEnum):
@@ -124,10 +126,10 @@ class ChargingStatus(BaseSchema):
     max_duration_minutes: int | None = None
     max_energy_kwh: float | None = None
     charge_param3: float | None = None
-    reservation_date: datetime
+    reservation_datetime: datetime
     user_id: str
     max_electricity: int
-    start_date: datetime
+    set_datetime: datetime
     duration_seconds: int
     start_kwh_counter: float
     current_kwh_counter: float
