@@ -29,6 +29,10 @@ class CommandEnum(IntEnum):
     HEADING_EVENT = 0x0003
     HEADING_RESPONSE = 0x8003
 
+    # Packet delimiters
+    HEADER = 0x0601
+    TAIL = 0x0F02
+
     # Status commands
     CURRENT_STATUS_EVENT = 0x0004
     CURRENT_STATUS_RESPONSE = 0x8004
@@ -43,9 +47,11 @@ class CommandEnum(IntEnum):
 
     # Setters/Getters
     NICKNAME_REQUEST = 0x8108
-    NICKNAME_RESPONSE = 0x0108
+    NICKNAME_EVENT = 0x0108
     OUTPUT_AMPERAGE_REQUEST = 0x8107
-    OUTPUT_AMPERAGE_REQUEST_RESPONSE = 0x0107
+    OUTPUT_AMPERAGE_EVENT = 0x0107
+    TEMPRATURE_UNIT_REQUEST = 0x8112
+    TEMPRATURE_UNIT_EVENT = 0x0112
 
     # Desired action for set/get commands
     SET_ACTION = 1
@@ -137,8 +143,8 @@ class DataPacket:
     def __init__(self, data: bytes):
         if data is None or not isinstance(data, bytes):
             raise ValueError("Data must be a non-empty bytes object")
-        if len(data) < 25:
-            raise ValueError("Data must be at least 25 bytes long")
+        if len(data) < 22:
+            raise ValueError("Data must be at least 22 bytes long")
         # Check header
         header = unpack(">H", data[0:2])[0]
         if header != 0x0601:

@@ -103,7 +103,7 @@ class SimpleEVSEProtocol:
             # as first action we probe to get a response/port number
             await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
             # wait for a short moment for transport setup and response from above
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
             await self.send_packet(self._build_packet(CommandEnum.LOGIN_REQUEST))
             await asyncio.wait_for(self._login_future, timeout=10)
             await self.request_essentials()
@@ -134,7 +134,7 @@ class SimpleEVSEProtocol:
         try:
             packet = DataPacket(data)
         except ValueError as e:
-            log.error(f"Invalid data packet received: {e}")
+            log.warning(f"Invalid data packet received: {e}")
             return
         cmd = packet.command
         # Handle login success
@@ -155,19 +155,21 @@ class SimpleEVSEProtocol:
             # Keepalive response
             asyncio.create_task(self.send_packet(self._build_packet(CommandEnum.HEADING_RESPONSE)))
         elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
-            log.debug(self._parse_status_response(packet))
+            log.debug(f"Current Status: \r\n {self._parse_status_response(packet)}")
             asyncio.create_task(self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_RESPONSE)))
             self.send_event(EvseStatus.__name__, self._status)
         elif cmd == CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
-            log.debug(self._parse_ac_charging_status(packet))
+            log.debug(f"Charging Status: \r\n {self._parse_current_charging_status(packet)}")
             self.send_event(ChargingStatus.__name__, self._charging_status)
-        elif cmd == CommandEnum.NICKNAME_RESPONSE:
+        elif cmd == CommandEnum.NICKNAME_EVENT:
             nickname = packet.get_string(1, packet.length() - 1)
             self._device_info.nickname = nickname
+            log.debug(f"Nickname: {nickname}")
             self.send_event(EvseDeviceInfo.__name__, self._device_info)
-        elif cmd == CommandEnum.OUTPUT_AMPERAGE_REQUEST_RESPONSE:
+        elif cmd == CommandEnum.OUTPUT_AMPERAGE_EVENT:
             amperage = packet.get_int(1, 1)
             self._device_info.configured_max_amps = amperage
+            log.debug(f"Configured Max Amps: {amperage}A")
             self.send_event(EvseDeviceInfo.__name__, self._device_info)
         elif cmd == CommandEnum.NOT_LOGGED_IN_EVENT:
             # After sending a LOGIN_CONFIRM_RESPONSE we get one of these.
@@ -200,9 +202,9 @@ class SimpleEVSEProtocol:
 
     async def start_charging(
         self,
-        max_amps: int = 16,
-        start_date: datetime = datetime.now(),
-        duration_minutes: int = 65535,
+        max_amps: int | None = None,
+        start_date: datetime | None = None,
+        duration_minutes: int | None = None,
     ) -> bool:
         """Send start charging request.
 
@@ -216,6 +218,17 @@ class SimpleEVSEProtocol:
         if self._status and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION:
             log.warning("Start charge send while a reservation is active, cancelling reservation first")
             await self.stop_charging()
+
+        # handle defaults like this because you can force none otherwise
+        if not start_date:
+            start_date = datetime.now()
+        if not duration_minutes or duration_minutes < 1 or duration_minutes > 65535:
+            duration_minutes = 65535
+        if not max_amps:
+            max_amps = self._device_info.configured_max_amps or self._device_info.max_amps
+        elif max_amps < 6 or max_amps > self._device_info.max_amps:
+            raise ValueError(f"max_amps must be between 6 and {self._device_info.max_amps}")
+
         extra_payload = bytearray(47)
 
         # Line ID (seems to be always one 1, are there any devices with multiple lines?)
@@ -267,14 +280,23 @@ class SimpleEVSEProtocol:
         """Set the EVSE nickname."""
         if not self._logged_in:
             raise NotLoggedInError("Please login before setting nickname")
-        if len(nickname) > 32:
-            log.warning("Nickname too long, truncating to 32 characters")
-            nickname = nickname[:32]
-        extra_payload = bytearray(1 + len(nickname))
+
+        max_display_nickname = 28
+        if len(nickname) > max_display_nickname:
+            log.warning(f"Nickname too long, truncating to {max_display_nickname} characters")
+            nickname = nickname[:max_display_nickname]
+
+        # Prepend "ACP#" prefix as required by the protocol
+        full_nickname = "ACP#" + nickname
+
+        extra_payload = bytearray(33)
+        extra_payload[0] = CommandEnum.SET_ACTION
+
         # Action: 0 = set, 1 = get
         struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
         # Nickname (up to 20 bytes, ASCII encoded)
-        struct.pack_into(f">{len(nickname)}s", extra_payload, 1, nickname.encode("ascii"))
+        struct.pack_into(f">{len(full_nickname)}s", extra_payload, 1, full_nickname.encode("ascii"))
+
         packet = self._build_packet(CommandEnum.NICKNAME_REQUEST, extra_payload)
         await self.send_packet(packet)
         return True
@@ -299,18 +321,24 @@ class SimpleEVSEProtocol:
         """Generic method to build a packet with given command and payload."""
         packet = bytearray(25 + len(payload))
 
-        # Header (0x0601)
-        struct.pack_into(">H", packet, 0, 0x0601)
+        # Header
+        struct.pack_into(">H", packet, 0, CommandEnum.HEADER)
         # Length
         struct.pack_into(">H", packet, 2, len(packet))
         # Key type
         packet[4] = 0x00
-        # Device serial (8 bytes) - use zeros for now
+        # Device serial (8 bytes) - use device serial if available
+        if self._device_info and self._device_info.serial_number:
+            try:
+                # Convert hex string to bytes
+                serial_bytes = bytes.fromhex(self._device_info.serial_number)
+                packet[5 : 5 + len(serial_bytes)] = serial_bytes
+            except ValueError:
+                # If serial is not valid hex, leave as zeros
+                pass
         # Password (6 bytes)
         if self.password:
             password_bytes = self.password.encode("ascii")[:6]
-        else:
-            password_bytes = b"\x00\x00\x00\x00\x00\x00"
         packet[13 : 13 + len(password_bytes)] = password_bytes
         # Command
         struct.pack_into(">H", packet, 19, cmd)
@@ -319,9 +347,9 @@ class SimpleEVSEProtocol:
         # Checksum
         checksum = sum(packet[:-4]) % 0xFFFF
         struct.pack_into(">H", packet, len(packet) - 4, checksum)
-        # Tail (0x0f02)
-        struct.pack_into(">H", packet, len(packet) - 2, 0x0F02)
-        log.debug(f"Built packet: cmd={cmd.name}, len={len(packet)}")
+        # Tail
+        struct.pack_into(">H", packet, len(packet) - 2, CommandEnum.TAIL)
+        log.debug(f"Built packet: cmd={cmd.name}, len={len(packet)}, payload_len={len(payload)}")
         return bytes(packet)
 
     def _parse_device_info(self, data: DataPacket):
@@ -373,7 +401,7 @@ class SimpleEVSEProtocol:
         except Exception as err:
             log.error("Failed to parse status response: %s", err)
 
-    def _parse_ac_charging_status(self, data: DataPacket):
+    def _parse_current_charging_status(self, data: DataPacket):
         """Parse AC charging status response."""
         try:
             if data.length() < 25:
@@ -393,12 +421,12 @@ class SimpleEVSEProtocol:
                 max_electricity=data.get_int(46, 1),
                 start_date=datetime.fromtimestamp(data.get_int(47, 4)),
                 duration_seconds=data.get_int(51, 4),
-                start_kwh_counter=data.get_int(55, 4) * 0.01,
-                current_kwh_counter=data.get_int(59, 4) * 0.01,
-                charge_kwh=data.get_int(63, 4) * 0.01,
-                charge_price=data.get_int(67, 4) * 0.01,
+                start_kwh_counter=data.get_int(55, 4) / 100,
+                current_kwh_counter=data.get_int(59, 4) / 100,
+                charge_kwh=data.get_int(63, 4) / 100,
+                charge_price=data.get_int(67, 4) / 100,
                 fee_type=data.get_int(71, 1),
-                charge_fee=data.get_int(72, 2) * 0.01,
+                charge_fee=data.get_int(72, 2) / 100,
             )
 
             return self._charging_status
