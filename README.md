@@ -10,15 +10,16 @@ This is based on the original TypeScript project by [johnwoo-nl](https://github.
 - Get EVSE status
 - Get EVSE charging status
 - Start/Stop charging
+- Get/Set EVSE nickname
+- Get/Set Current limit
 
 ## Being Implemented
 - Create/Update charging schedule
-- Get/Set charging limits
-- Getting/Setting device properties like name, time, language, etc.
+- Getting/Setting device properties like time, language, etc.
 
 ## Not Planned
 - Home Assistant or MQTT integration (see [evsemaster-homeassistant](https://github.com/RafaelSchridi/evsemaster-homeassistant))
-- Connecting to the EVSE via Bluetooth (ie. connecting the EVSE to wifi)
+- Connecting to the EVSE via Bluetooth (ie. for connecting the EVSE to wifi)
   * Even though the EVSEMaster app is awful to use, using it once to connect the EVSE to wifi is sufficient for most use cases.
 
 
