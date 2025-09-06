@@ -269,24 +269,35 @@ class SimpleEVSEProtocol:
 
     def _datetime_to_shanghai_epoch(self, dt: datetime) -> int:
         """
-        The EVSE handles time weirdly, time interpretation is always in Asia/Shanghai timezone.
-        So any time object you give it it will convert to Asia/Shanghai.
-        So we always convert to Asia/Shanghai here.
+        The EVSE handles time weirdly,
+        It expects the time to be whatever the requested time would be in Asia/Shanghai timezone.
+        While setting the time we can just swap the timezone to Asia/Shanghai and get the epoch from that.
         """
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=shanghai_tz)
-        else:
-            dt = dt.astimezone(shanghai_tz)
+        dt = dt.replace(tzinfo=shanghai_tz)
         return int(dt.timestamp())
 
     def _shanghai_epoch_to_datetime(self, epoch: int) -> datetime:
         """
-        Similarly we receive the time as epoch seconds but always in Asia/Shanghai timezone.
+        This EVSE returns timestamps in the weirdest way possible.
+        The timestamps it gives you back are TZ converted to our TZ but the time is all wrong
+        Because it gives the time it gives back is the time our epoch would happen IN SHANGHAI
+        So we need to calculate the offset between Shanghai and our local timezone
+        and apply that to the naive datetime we get from the epoch.
         """
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
-        dt = datetime.fromtimestamp(epoch).replace(tzinfo=shanghai_tz)
-        return dt
+        local_tz = datetime.now().astimezone().tzinfo
+
+        now = datetime.now()
+        shanghai_now = now.replace(tzinfo=shanghai_tz)
+        local_now = now.replace(tzinfo=local_tz)
+
+        # Calculate the offset between Shanghai and local timezone, from their pov
+        offset = shanghai_now.utcoffset() - local_now.utcoffset()
+
+        naive_dt = datetime.fromtimestamp(epoch)
+        corrected_dt = naive_dt + offset
+        return corrected_dt.replace(tzinfo=local_tz)
 
     async def set_nickname(self, nickname: str) -> bool:
         """Set the EVSE nickname."""
