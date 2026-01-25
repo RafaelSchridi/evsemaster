@@ -278,7 +278,7 @@ class SimpleEVSEProtocol:
         # Charge ID (16 bytes, ASCII encoded)
         struct.pack_into(">16s", extra_payload, 17, start_date.strftime("%Y%m%d%H%M").encode("ascii")[:16])
         # Reservation: 0 for now, 1 if future reservation
-        struct.pack_into(">B", extra_payload, 33, 0 if datetime.now() > start_date else 1)
+        struct.pack_into(">B", extra_payload, 33, 0 if now_aware() > start_date else 1)
         # Reservation date (current time in Shanghai epoch)
         struct.pack_into(
             ">I", extra_payload, 34, self._datetime_to_shanghai_epoch(start_date, apply_epoch_adjustment=True)
