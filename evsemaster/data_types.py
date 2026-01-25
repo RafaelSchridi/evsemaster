@@ -7,6 +7,11 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 
+def now_aware() -> datetime:
+    """Get the current datetime with timezone info."""
+    return datetime.now().astimezone()
+
+
 class BaseSchema(BaseModel):
     """Base schema for all data types."""
 

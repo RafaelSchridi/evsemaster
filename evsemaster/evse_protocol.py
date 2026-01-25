@@ -14,6 +14,7 @@ from .data_types import (
     ChargingStatus,
     CurrentStateEnum,
     NotLoggedInError,
+    now_aware,
 )
 
 log = logging.getLogger(__name__)
@@ -183,14 +184,15 @@ class SimpleEVSEProtocol:
                 )
                 if action == CommandEnum.GET_ACTION:
                     # calculate time delta
-                    local_epoch = int(datetime.now().timestamp())
+                    local_epoch = int(now_aware().timestamp())
                     device_epoch += self._get_shanghai_offset()
                     delta = device_epoch - local_epoch
                     if (
                         delta > 86400 and delta - self._time_delta > 60
                     ):  # only update if > 1 day and changed by > 1 minute
+                        delta += 60 - (delta % 60)  # round up to whole minutes
                         self._time_delta = delta
-                        log.debug(f"Calculated time delta: {self._time_delta} ms")
+                        log.debug(f"Calculated time delta: {self._time_delta} s")
             else:
                 log.debug(f"System time event received (action: {action})")
         elif cmd == CommandEnum.NOT_LOGGED_IN_EVENT:
@@ -259,7 +261,7 @@ class SimpleEVSEProtocol:
 
         # handle defaults like this because you can force none otherwise
         if not start_date:
-            start_date = datetime.now()
+            start_date = now_aware()
         if not duration_minutes or duration_minutes < 1 or duration_minutes > 65535:
             duration_minutes = 65535
         if not max_amps:
@@ -310,10 +312,9 @@ class SimpleEVSEProtocol:
     def _get_shanghai_offset(self) -> int:
         """Calculate offset between local timezone and Shanghai timezone in seconds."""
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
-        local_tz = datetime.now().astimezone().tzinfo
 
-        now = datetime.now()
-        local_offset = now.replace(tzinfo=local_tz).utcoffset().total_seconds()
+        now = now_aware()
+        local_offset = now.utcoffset().total_seconds()
         shanghai_offset = now.replace(tzinfo=shanghai_tz).utcoffset().total_seconds()
         offset = shanghai_offset - local_offset
         return int(offset)
@@ -329,12 +330,7 @@ class SimpleEVSEProtocol:
 
         apply_epoch_adjustment: If True, applies a calculated time delta workaround of now + the time the device itself thinks it is (31 days offset as of Jan 2026)
         """
-        local_tz = datetime.now().astimezone().tzinfo
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=local_tz)
-
-        # Calculate offset between Shanghai and local timezone
+        # subtract offset to get "Shanghai time"
         epoch = int((dt.timestamp() - self._get_shanghai_offset()))
 
         # FIRMWARE BUG WORKAROUND: add time delta if calculated and requested
@@ -344,7 +340,7 @@ class SimpleEVSEProtocol:
 
         return epoch
 
-    def _shanghai_epoch_to_datetime(self, epoch: int) -> datetime:
+    def _shanghai_epoch_to_datetime(self, evse_epoch_time: int) -> datetime:
         """
         Convert EVSE timestamp to local datetime.
         The EVSE stores timestamps as if they were in Shanghai timezone.
@@ -353,21 +349,15 @@ class SimpleEVSEProtocol:
         - Calculate the offset between local and Shanghai timezone
         - Add that offset to the timestamp
         """
-        local_tz = datetime.now().astimezone().tzinfo
-
-        # Calculate offset between Shanghai and local timezone
-        now = datetime.now()
-        local_offset = now.replace(tzinfo=local_tz).utcoffset().total_seconds()
-        offset = self._get_shanghai_offset() - local_offset
+        # add offset to get correct local time
+        epoch = evse_epoch_time + self._get_shanghai_offset()
 
         # FIRMWARE BUG WORKAROUND: subtract time delta if calculated and out of sync by more than 1 day
-        if self._time_delta != 0 and epoch - int(now.timestamp()) > 86400:
-            offset -= self._time_delta
+        if self._time_delta != 0 and evse_epoch_time - int(now_aware().timestamp()) > 86400:
+            epoch -= self._time_delta
             log.debug(f"Applied time delta workaround: adjusted epoch by -{self._time_delta} seconds")
 
-        # Add offset to get correct local time
-        corrected_dt = datetime.fromtimestamp(epoch + offset)
-        return corrected_dt.replace(tzinfo=local_tz)
+        return datetime.fromtimestamp(epoch, tz=now_aware().tzinfo)
 
     async def set_nickname(self, nickname: str) -> bool:
         """Set the EVSE nickname."""
@@ -422,7 +412,7 @@ class SimpleEVSEProtocol:
             raise NotLoggedInError("Please login before setting device time")
 
         if not dt:
-            dt = datetime.now()
+            dt = now_aware()
 
         # Convert to Shanghai timezone epoch using the same logic as the device expects
         shanghai_epoch = self._datetime_to_shanghai_epoch(dt)
@@ -530,8 +520,13 @@ class SimpleEVSEProtocol:
 
             raw_reservation_epoch = data.get_int(26, 4)
             raw_set_epoch = data.get_int(47, 4)
-            res_time = self._shanghai_epoch_to_datetime(raw_reservation_epoch)
-            set_time = self._shanghai_epoch_to_datetime(raw_set_epoch)
+            raw_max_duration_minutes = data.get_int(20, 2)
+            res_time = self._shanghai_epoch_to_datetime(raw_reservation_epoch) if raw_reservation_epoch != 0 else None
+            set_time = self._shanghai_epoch_to_datetime(raw_set_epoch) if raw_set_epoch != 0 else None
+            if raw_max_duration_minutes == 65535 or raw_max_duration_minutes == 0:
+                max_duration_minutes = None
+            else:
+                max_duration_minutes = raw_max_duration_minutes
 
             self._charging_status = ChargingStatus(
                 line_id=data.get_int(0, 1),
@@ -539,7 +534,7 @@ class SimpleEVSEProtocol:
                 charge_id=data.get_string(2, 16),
                 start_type=data.get_int(18, 1),
                 charge_type=data.get_int(19, 1),
-                max_duration_minutes=None if data.get_int(20, 2) == 65535 else data.get_int(20, 2),
+                max_duration_minutes=max_duration_minutes,
                 max_energy_kwh=None if data.get_int(22, 2) == 65535 else data.get_int(22, 2) * 0.01,
                 charge_param3=None if data.get_int(24, 2) == 65535 else data.get_int(24, 2) * 0.01,
                 reservation_datetime=res_time,
