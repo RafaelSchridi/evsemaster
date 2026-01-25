@@ -262,6 +262,9 @@ class SimpleEVSEProtocol:
         # handle defaults like this because you can force none otherwise
         if not start_date:
             start_date = now_aware()
+        else:
+            if start_date.tzinfo is None:
+                raise ValueError("start_date must be timezone aware datetime")
         if not duration_minutes or duration_minutes < 1 or duration_minutes > 65535:
             duration_minutes = 65535
         if not max_amps:
