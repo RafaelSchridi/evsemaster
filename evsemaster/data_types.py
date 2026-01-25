@@ -131,13 +131,13 @@ class ChargingStatus(BaseSchema):
     charge_id: str
     start_type: int
     charge_type: int
-    max_duration_minutes: int | None = None
-    max_energy_kwh: float | None = None
-    charge_param3: float | None = None
-    reservation_datetime: datetime
+max_duration_minutes: int | None
+max_energy_kwh: float | None
+charge_param3: float | None
+    reservation_datetime: datetime | None
     user_id: str
     max_electricity: int
-    set_datetime: datetime
+    set_datetime: datetime | None
     duration_seconds: int
     start_kwh_counter: float
     current_kwh_counter: float
