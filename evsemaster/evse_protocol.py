@@ -58,6 +58,7 @@ class SimpleEVSEProtocol:
         self._device_info: Optional[EvseDeviceInfo] = None
         self._charging_status: Optional[ChargingStatus] = None
         self._discovery_running = False
+        self._time_delta = 0
 
     async def send_packet(self, data: bytes):
         if not self._transport:
@@ -78,7 +79,7 @@ class SimpleEVSEProtocol:
             log.info("Datagram endpoint ready (listening %s:%d)", "0.0.0.0", self.listen_port)
             return True
         except Exception as err:
-            log.error(f"Failed to create datagram endpoint: {err}")
+            log.error(f"Failed to create datagram endpoint: {err} on port {self.listen_port}")
             return False
 
     async def disconnect(self):
@@ -171,6 +172,27 @@ class SimpleEVSEProtocol:
             self._device_info.configured_max_amps = amperage
             log.debug(f"Configured Max Amps: {amperage}A")
             self.send_event(EvseDeviceInfo.__name__, self._device_info)
+        elif cmd == CommandEnum.SYSTEM_TIME_EVENT:
+            # Response from setting device time
+            action = packet.get_int(0, 1)
+            if packet.length() >= 5:
+                device_epoch = packet.get_int(1, 4)
+                device_time = self._shanghai_epoch_to_datetime(device_epoch)
+                log.info(
+                    f"Device time {'set' if action == CommandEnum.SET_ACTION else 'get'}: {device_time} (epoch: {device_epoch})"
+                )
+                if action == CommandEnum.GET_ACTION:
+                    # calculate time delta
+                    local_epoch = int(datetime.now().timestamp())
+                    device_epoch += self._get_shanghai_offset()
+                    delta = device_epoch - local_epoch
+                    if (
+                        delta > 86400 and delta - self._time_delta > 60
+                    ):  # only update if > 1 day and changed by > 1 minute
+                        self._time_delta = delta
+                        log.debug(f"Calculated time delta: {self._time_delta} ms")
+            else:
+                log.debug(f"System time event received (action: {action})")
         elif cmd == CommandEnum.NOT_LOGGED_IN_EVENT:
             # After sending a LOGIN_CONFIRM_RESPONSE we get one of these.
             # so we can ignore the first few
@@ -185,16 +207,20 @@ class SimpleEVSEProtocol:
             self._login_attempts = 0
 
     async def request_status(self) -> bool:
-        """Request current EVSE status (async)."""
+        """Request current EVSE status."""
         if not self._logged_in:
             raise NotLoggedInError("Please login before requesting status")
         await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
+        # get device time
+        await self.send_packet(self._build_packet(CommandEnum.SYSTEM_TIME_REQUEST, bytes([CommandEnum.GET_ACTION])))
         return True
 
     async def request_essentials(self) -> bool:
-        """Send some commands to get basic info."""
+        """Send some commands to get basic info and sync device time."""
         if not self._logged_in:
             raise NotLoggedInError("Please login before getting essentials")
+        # Sync device time first to ensure correct timestamps
+        await self.set_device_time()
         await self.send_packet(self._build_packet(CommandEnum.NICKNAME_REQUEST, bytes([CommandEnum.GET_ACTION])))
         await self.send_packet(self._build_packet(CommandEnum.OUTPUT_AMPERAGE_REQUEST, bytes([CommandEnum.GET_ACTION])))
         await self.send_packet(self._build_packet(CommandEnum.CURRENT_STATUS_EVENT))
@@ -215,8 +241,20 @@ class SimpleEVSEProtocol:
         if not self._logged_in:
             raise NotLoggedInError("Please login before starting charge")
 
-        if self._status and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION:
-            log.warning("Start charge send while a reservation is active, cancelling reservation first")
+        if (
+            self._status
+            and self._status.current_state == CurrentStateEnum.CHARGING_RESERVATION
+            or self._status
+            and self._status.current_state == CurrentStateEnum.COMPLETED
+            or self._status
+            and self._status.current_state == CurrentStateEnum.COMPLETED_FULL_CHARGE
+        ):
+            log.warning("Start charge send while a reservation/complete flag is active, cancelling first")
+            await self.stop_charging()
+
+        if self._status and self._status.current_state == CurrentStateEnum.CHARGING and start_date:
+            # already charging, cannot schedule so stop first
+            log.warning("Start charge send while already charging, stopping first to schedule new start")
             await self.stop_charging()
 
         # handle defaults like this because you can force none otherwise
@@ -240,7 +278,9 @@ class SimpleEVSEProtocol:
         # Reservation: 0 for now, 1 if future reservation
         struct.pack_into(">B", extra_payload, 33, 0 if datetime.now() > start_date else 1)
         # Reservation date (current time in Shanghai epoch)
-        struct.pack_into(">I", extra_payload, 34, self._datetime_to_shanghai_epoch(start_date))
+        struct.pack_into(
+            ">I", extra_payload, 34, self._datetime_to_shanghai_epoch(start_date, apply_epoch_adjustment=True)
+        )
         # Start type (always 1)
         struct.pack_into(">B", extra_payload, 38, 1)
         # Charge type (always 1)
@@ -267,36 +307,66 @@ class SimpleEVSEProtocol:
         await self.send_packet(self._build_packet(CommandEnum.CHARGE_STOP_REQUEST, extra_payload))
         return True
 
-    def _datetime_to_shanghai_epoch(self, dt: datetime) -> int:
-        """
-        The EVSE handles time weirdly,
-        It expects the time to be whatever the requested time would be in Asia/Shanghai timezone.
-        While setting the time we can just swap the timezone to Asia/Shanghai and get the epoch from that.
-        """
-        shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
-        dt = dt.replace(tzinfo=shanghai_tz)
-        return int(dt.timestamp())
-
-    def _shanghai_epoch_to_datetime(self, epoch: int) -> datetime:
-        """
-        This EVSE returns timestamps in the weirdest way possible.
-        The timestamps it gives you back are TZ converted to our TZ but the time is all wrong
-        Because it gives the time it gives back is the time our epoch would happen IN SHANGHAI
-        So we need to calculate the offset between Shanghai and our local timezone
-        and apply that to the naive datetime we get from the epoch.
-        """
+    def _get_shanghai_offset(self) -> int:
+        """Calculate offset between local timezone and Shanghai timezone in seconds."""
         shanghai_tz = zoneinfo.ZoneInfo("Asia/Shanghai")
         local_tz = datetime.now().astimezone().tzinfo
 
         now = datetime.now()
-        shanghai_now = now.replace(tzinfo=shanghai_tz)
-        local_now = now.replace(tzinfo=local_tz)
+        local_offset = now.replace(tzinfo=local_tz).utcoffset().total_seconds()
+        shanghai_offset = now.replace(tzinfo=shanghai_tz).utcoffset().total_seconds()
+        offset = shanghai_offset - local_offset
+        return int(offset)
 
-        # Calculate the offset between Shanghai and local timezone, from their pov
-        offset = shanghai_now.utcoffset() - local_now.utcoffset()
+    def _datetime_to_shanghai_epoch(self, dt: datetime, apply_epoch_adjustment: bool = False) -> int:
+        """
+        Convert local datetime to EVSE timestamp.
+        The EVSE interprets all timestamps as if they were in Shanghai timezone.
 
-        naive_dt = datetime.fromtimestamp(epoch)
-        corrected_dt = naive_dt + offset
+        Following the TypeScript reference implementation:
+        - Calculate the offset between local and Shanghai timezone
+        - Subtract that offset from the timestamp
+
+        apply_epoch_adjustment: If True, applies a calculated time delta workaround of now + the time the device itself thinks it is (31 days offset as of Jan 2026)
+        """
+        local_tz = datetime.now().astimezone().tzinfo
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=local_tz)
+
+        # Calculate offset between Shanghai and local timezone
+        epoch = int((dt.timestamp() - self._get_shanghai_offset()))
+
+        # FIRMWARE BUG WORKAROUND: add time delta if calculated and requested
+        if self._time_delta != 0 and apply_epoch_adjustment:
+            epoch += self._time_delta
+            log.debug(f"Applied time delta workaround: adjusted epoch by +{self._time_delta} seconds")
+
+        return epoch
+
+    def _shanghai_epoch_to_datetime(self, epoch: int) -> datetime:
+        """
+        Convert EVSE timestamp to local datetime.
+        The EVSE stores timestamps as if they were in Shanghai timezone.
+
+        Following the TypeScript reference implementation:
+        - Calculate the offset between local and Shanghai timezone
+        - Add that offset to the timestamp
+        """
+        local_tz = datetime.now().astimezone().tzinfo
+
+        # Calculate offset between Shanghai and local timezone
+        now = datetime.now()
+        local_offset = now.replace(tzinfo=local_tz).utcoffset().total_seconds()
+        offset = self._get_shanghai_offset() - local_offset
+
+        # FIRMWARE BUG WORKAROUND: subtract time delta if calculated and out of sync by more than 1 day
+        if self._time_delta != 0 and epoch - int(now.timestamp()) > 86400:
+            offset -= self._time_delta
+            log.debug(f"Applied time delta workaround: adjusted epoch by -{self._time_delta} seconds")
+
+        # Add offset to get correct local time
+        corrected_dt = datetime.fromtimestamp(epoch + offset)
         return corrected_dt.replace(tzinfo=local_tz)
 
     async def set_nickname(self, nickname: str) -> bool:
@@ -338,6 +408,34 @@ class SimpleEVSEProtocol:
 
         packet = self._build_packet(CommandEnum.OUTPUT_AMPERAGE_REQUEST, extra_payload)
         await self.send_packet(packet)
+        return True
+
+    async def set_device_time(self, dt: datetime | None = None) -> bool:
+        """Set the EVSE device's internal clock.
+
+        dt: datetime to set (defaults to current time)
+
+        The device stores time in a weird way - we need to calculate the offset
+        between local timezone and Shanghai timezone and apply it to the timestamp.
+        """
+        if not self._logged_in:
+            raise NotLoggedInError("Please login before setting device time")
+
+        if not dt:
+            dt = datetime.now()
+
+        # Convert to Shanghai timezone epoch using the same logic as the device expects
+        shanghai_epoch = self._datetime_to_shanghai_epoch(dt)
+
+        extra_payload = bytearray(5)
+        # Action: set (1)
+        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        # Timestamp as 4-byte unsigned int
+        struct.pack_into(">I", extra_payload, 1, shanghai_epoch)
+
+        packet = self._build_packet(CommandEnum.SYSTEM_TIME_REQUEST, extra_payload)
+        await self.send_packet(packet)
+        log.info(f"Setting device time to {dt} (Shanghai epoch: {shanghai_epoch})")
         return True
 
     def _build_packet(self, cmd: CommandEnum, payload: bytes = b"") -> bytes:
@@ -430,6 +528,11 @@ class SimpleEVSEProtocol:
             if data.length() < 25:
                 return
 
+            raw_reservation_epoch = data.get_int(26, 4)
+            raw_set_epoch = data.get_int(47, 4)
+            res_time = self._shanghai_epoch_to_datetime(raw_reservation_epoch)
+            set_time = self._shanghai_epoch_to_datetime(raw_set_epoch)
+
             self._charging_status = ChargingStatus(
                 line_id=data.get_int(0, 1),
                 current_state=data.get_int(1, 1),
@@ -439,10 +542,10 @@ class SimpleEVSEProtocol:
                 max_duration_minutes=None if data.get_int(20, 2) == 65535 else data.get_int(20, 2),
                 max_energy_kwh=None if data.get_int(22, 2) == 65535 else data.get_int(22, 2) * 0.01,
                 charge_param3=None if data.get_int(24, 2) == 65535 else data.get_int(24, 2) * 0.01,
-                reservation_datetime=self._shanghai_epoch_to_datetime(data.get_int(26, 4)),
+                reservation_datetime=res_time,
                 user_id=data.get_string(30, 16),
                 max_electricity=data.get_int(46, 1),
-                set_datetime=self._shanghai_epoch_to_datetime(data.get_int(47, 4)),
+                set_datetime=set_time,
                 duration_seconds=data.get_int(51, 4),
                 start_kwh_counter=data.get_int(55, 4) / 100,
                 current_kwh_counter=data.get_int(59, 4) / 100,

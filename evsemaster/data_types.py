@@ -57,13 +57,16 @@ class CommandEnum(IntEnum):
     SET_ACTION = 1
     GET_ACTION = 2
 
+    # System time commands
+    SYSTEM_TIME_REQUEST = 0x8101  # 33025
+    SYSTEM_TIME_EVENT = 0x0101  # 257
+
     #### Haven't touched yet ####s
     CURRENT_CHARGE_RECORD_REQUEST = 0x800D
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
     REQUEST_STATUS_RECORD = 0x000D
     POSSIBLE_REPEATED = 270
-    POSSIBLE_TIME = 257
 
 
 class PlugStateEnum(IntEnum):

@@ -1,7 +1,7 @@
 # evsemaster
 
 Python client library for communicating with a EVSE chargers that use the EVSEMaster app. I've only done my testing on a Telestar EC311S6, but it *should* work with any EVSE that uses the EVSEMaster app protocol.   
-I'm intenting to keep this a simple implementation, so it does not have all the features of the original TypeScript project, but it should be sufficient for basic use cases like Home Assistant integration.
+I'm intenting to keep this a simple implementation, so it does not have all the features of the original TypeScript project, but it should be sufficient for basic use cases like my Home Assistant integration.
 
 This is based on the original TypeScript project by [johnwoo-nl](https://github.com/johnwoo-nl/emproto)
 
@@ -12,6 +12,7 @@ This is based on the original TypeScript project by [johnwoo-nl](https://github.
 - Start/Stop charging
 - Get/Set EVSE nickname
 - Get/Set Current limit
+- Get/Set Device Time (Correcting for on-device errors that causes drift)
 
 ## Being Implemented
 - Create/Update charging schedule
