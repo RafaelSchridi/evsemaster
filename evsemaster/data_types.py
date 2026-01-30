@@ -148,22 +148,37 @@ class ChargingStatus(BaseSchema):
 
 
 class DataPacket:
-    """Class for incomind data with unpack functions."""
+    """Class for incoming data with unpack functions."""
 
     def __init__(self, data: bytes):
         if data is None or not isinstance(data, bytes):
             raise ValueError("Data must be a non-empty bytes object")
-        if len(data) < 22:
-            raise ValueError("Data must be at least 22 bytes long")
+        if len(data) < 25:
+            raise ValueError("Data must be at least 25 bytes long")
         # Check header
-        header = unpack(">H", data[0:2])[0]
-        if header != 0x0601:
-            raise ValueError(f"Invalid header: {header:#04x}, expected 0x0601")
+        header, length, _key_type = unpack(">HHB", data[0:5])
+        if header != CommandEnum.HEADER:
+            raise ValueError(f"Invalid header: {header:#04x}, expected {CommandEnum.HEADER}")
+        if len(data) != length:
+            raise ValueError(f"Data length mismatches header: {len(data)}, expected {length}")
+
+        self.device_serial = data[5:13].hex()  # Device serial number
+        _unused_password = data[13:19]
+
         self.command: CommandEnum = CommandEnum(unpack(">H", data[19:21])[0])
         if self.command not in CommandEnum:
             raise ValueError(f"Unknown command: {self.command}")
-        self.device_serial = data[5:13].hex()  # Device serial number
-        self.data = data[21:]  # drop all bytes before the data section
+
+        checksum, tail = unpack(">HH", data[-4:])
+        if tail != CommandEnum.TAIL:
+            raise ValueError(f"Invalid tail: {tail:#04x}, expected {CommandEnum.TAIL}")
+
+        data_checksum = sum(data[:-4])
+        if data_checksum % 0xffff != checksum:
+            raise ValueError(f"Invalid checksum: {data_checksum:#04x}, expected {checksum:#04x}")
+
+        self.data = data[21:-4]  # Extract the data section
+
         log.debug(self.__repr__())
 
     def __repr__(self):
