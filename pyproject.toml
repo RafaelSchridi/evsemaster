@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "evsemaster"
-version = "1.3.2"
+version = "1.3.3"
 description = "Python implementation of the EVSEMaster App"
 authors = [
     "Rafaël Schridi <rafael@schridi.nl>"
@@ -13,8 +13,8 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.13"
-pydantic = "^2.10.0"
-tzdata = "^2025.1"
+pydantic = ">=2.0,<3.0"
+tzdata = ">=2025.1"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.12.8"

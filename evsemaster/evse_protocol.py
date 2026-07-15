@@ -1,6 +1,8 @@
 """Simple EVSE protocol implementation for Home Assistant integration."""
 
+import errno
 import logging
+import socket
 import struct
 from typing import Any, Optional
 from datetime import datetime
@@ -23,6 +25,7 @@ log = logging.getLogger(__name__)
 class _EVSEDatagramProtocol(asyncio.DatagramProtocol):
     def __init__(self, parent: "SimpleEVSEProtocol"):
         self.parent = parent
+        self.closed = asyncio.Event()
 
     def datagram_received(self, data: bytes, addr):  # type: ignore[override]
         try:
@@ -35,8 +38,12 @@ class _EVSEDatagramProtocol(asyncio.DatagramProtocol):
 
     def connection_lost(self, exc):  # type: ignore[override]
         log.info("Datagram connection lost")
-        self.parent._logged_in = False
-        self.parent._transport = None
+        self.closed.set()
+        # only reset parent state if it still refers to this (not a newer) endpoint
+        if self.parent._protocol is self:
+            self.parent._logged_in = False
+            self.parent._transport = None
+            self.parent._protocol = None
 
 
 class SimpleEVSEProtocol:
@@ -51,6 +58,8 @@ class SimpleEVSEProtocol:
         self.send_port = 7248  # Default port to send to (will be updated by discovery)
         self.user_id = "evsemasterpy"  # Do all actions as this "user"
         self._transport: Optional[asyncio.DatagramTransport] = None
+        self._protocol: Optional[_EVSEDatagramProtocol] = None
+        self._host_ip: Optional[str] = None
         self._login_future: Optional[asyncio.Future] = None
         self._pending: dict[str, asyncio.Future] = {}
         self._logged_in = False
@@ -72,25 +81,57 @@ class SimpleEVSEProtocol:
 
     async def connect(self) -> bool:
         """Create datagram endpoint and prepare transport."""
+        if self._transport:
+            return True
+        loop = asyncio.get_running_loop()
         try:
-            loop = asyncio.get_running_loop()
-            self._transport, protocol = await loop.create_datagram_endpoint(
-                lambda: _EVSEDatagramProtocol(self), local_addr=("0.0.0.0", self.listen_port)
+            if not self._host_ip:
+                infos = await loop.getaddrinfo(self.host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+                self._host_ip = infos[0][4][0]
+        except OSError as err:
+            log.error(f"Failed to resolve EVSE host {self.host}: {err}")
+            return False
+        try:
+            self._transport, self._protocol = await loop.create_datagram_endpoint(
+                lambda: _EVSEDatagramProtocol(self),
+                local_addr=("0.0.0.0", self.listen_port),
+                # share the port with other instances (config flow validation, multiple devices)
+                reuse_port=True if hasattr(socket, "SO_REUSEPORT") else None,
             )
             log.info("Datagram endpoint ready (listening %s:%d)", "0.0.0.0", self.listen_port)
             return True
+        except OSError as err:
+            if err.errno == errno.EADDRINUSE:
+                log.error(
+                    f"UDP port {self.listen_port} is already in use by another application "
+                    "(or another EVSE client without port sharing), cannot listen for EVSE packets"
+                )
+            else:
+                log.error(f"Failed to create datagram endpoint: {err} on port {self.listen_port}")
+            return False
         except Exception as err:
             log.error(f"Failed to create datagram endpoint: {err} on port {self.listen_port}")
             return False
 
     async def disconnect(self):
-        """Close transport."""
-        if self._transport:
-            self._transport.close()
-            self._transport = None
+        """Close transport and wait until the socket is actually released."""
+        # detach and reset all state synchronously (no await) so a concurrent
+        # connect/login can't be clobbered after the wait below
+        transport, protocol = self._transport, self._protocol
+        self._transport = None
+        self._protocol = None
         self._logged_in = False
         self._login_future = None
         self._pending.clear()
+        if transport:
+            transport.close()
+            # transport.close() releases the socket a loop iteration later; wait for it
+            # so an immediate reconnect can't hit EADDRINUSE against our own socket
+            if protocol:
+                try:
+                    await asyncio.wait_for(protocol.closed.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    log.debug("Timed out waiting for transport to close")
 
     async def login(self) -> bool:
         if self._logged_in:
@@ -129,8 +170,13 @@ class SimpleEVSEProtocol:
                 log.error(f"Error in event callback: {e}")
 
     async def _on_datagram(self, data: bytes, addr):
+        # Only handle packets from our own EVSE; the port is shared and other
+        # devices/applications may broadcast to it as well
+        if self._host_ip and addr[0] != self._host_ip:
+            log.debug(f"Ignoring datagram from unexpected source {addr[0]}:{addr[1]}")
+            return
         # Adjust discovered port if needed
-        if addr[0] == self.host and addr[1] != self.send_port:
+        if addr[1] != self.send_port:
             log.debug(f"Discovered/updated EVSE port {addr[1]} (was {self.send_port})")
             self.send_port = addr[1]
         try:
