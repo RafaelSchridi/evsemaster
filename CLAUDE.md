@@ -4,32 +4,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-`evsemaster` is an asyncio Python (>=3.13) client library for EVSE chargers that use the EVSEMaster app, speaking its reverse-engineered UDP protocol (based on the TypeScript project [johnwoo-nl/emproto](https://github.com/johnwoo-nl/emproto)). The Home Assistant integration that consumes this library lives in the sibling repo `RafaelSchridi/evsemaster-homeassistant` (see its CLAUDE.md for the cross-repo dev workflow).
+`evsemaster` is an asyncio Python (>=3.14) client library for EVSE chargers that use the EVSEMaster app, speaking its reverse-engineered UDP protocol (based on the TypeScript project [johnwoo-nl/emproto](https://github.com/johnwoo-nl/emproto)). The Home Assistant integration that consumes this library lives in the sibling repo `RafaelSchridi/evsemaster-homeassistant` (see its CLAUDE.md for the cross-repo dev workflow).
 
 ## Commands
 
 - Install: `poetry install`
 - Lint/format: `poetry run ruff check` / `poetry run ruff format` (line-length 120)
-- There are no unit tests; testing happens against real hardware with the interactive script:
-  `poetry run python test.py <host> <6-digit-password>` — accepts shortcuts (`status`, `start [amps] [YYYY-MM-DDTHH:MM:SS] [duration_min]`, `stop`), `CommandEnum` names, or raw hex/decimal command values.
+- Test: `poetry run pytest` (or `poe check` for lint + tests). `tests/` covers the codec and
+  parsers, listener routing, and device sessions driven over loopback by `evsemaster.testing.FakeEvse`.
+  Each test takes a port of its own from the `listen_port` fixture; never bind 28376 in a test.
+- Testing against real hardware uses the interactive script:
+  `poetry run python test.py <host>:<password> [<host>:<password> ...]` — accepts shortcuts (`status`,
+  `start [amps] [YYYY-MM-DDTHH:MM:SS] [duration_min]`, `stop`, `discover`, `use <n>`, `all`),
+  `CommandEnum` names, or raw hex/decimal command values.
 
 ## Architecture
 
-Two modules in `evsemaster/`:
+Modules in `evsemaster/`:
 
 **`data_types.py`**
 - `CommandEnum` — protocol command codes. Naming convention: `*_REQUEST` = client-initiated (you send), `*_EVENT` = anything incoming from the EVSE (reply or unsolicited), `*_RESPONSE` = what you send back to an event.
-- Pydantic models `EvseDeviceInfo`, `EvseStatus`, `ChargingStatus` hold parsed device state.
-- `DataPacket` — parser for incoming packets. Big-endian; header `0x0601`, device serial at bytes 5–13, command at 19–21, payload from 21.
+- Pydantic models `EvseDeviceInfo`, `EvseStatus`, `ChargingStatus`, `DiscoveredDevice`.
+- `DataPacket` — parser for incoming packets. Big-endian; header `0x0601`, device serial at bytes 5–13, command at 19–21, payload from 21 up to the trailing checksum + tail (so `length()` is the true payload length: a single-phase status is 25 bytes, three-phase 33).
 
-**`evse_protocol.py`** — `SimpleEVSEProtocol`, the single public entry point.
-- UDP via asyncio `DatagramProtocol`: listens on 28376, initially sends to 7248; the real device port is discovered from the source address of incoming datagrams (`_on_datagram`).
-- Login: `LOGIN_REQUEST` is sent twice 5s apart (the first doubles as port discovery), then await `LOGIN_SUCCESS_EVENT` and reply `LOGIN_CONFIRM_RESPONSE`. Every outgoing packet embeds the 6-char password (`_build_packet`).
-- Push-based: the EVSE sends status/charging events unsolicited; `_on_datagram` dispatches them and answers keepalives (`HEADING_EVENT`). Consumers receive updates via the `event_callback(event_type, data)` constructor arg, where `event_type` is the model class name (e.g. `"EvseStatus"`).
+**`capabilities.py`** — per-model quirks the protocol cannot be asked about, keyed on the brand/model reported at login. A deny-list: unrecognised chargers get the permissive default. Reached through `EvseDevice.capabilities`.
+
+**`protocol.py`** — stateless codec, no device or socket state: `build_packet`, `parse_device_info`, `parse_status`, `parse_charging_status`, `shanghai_offset`.
+
+**`listener.py`** — `EvseListener` owns the single UDP socket (binds 28376, `SO_BROADCAST` for probing) and routes packets **by device serial first, source IP second**, so several chargers share one socket and a DHCP address change is followed automatically. A packet whose serial belongs to no registered device becomes a `DiscoveredDevice` (once per serial). `probe()` broadcasts a zero-serial, zero-password `LOGIN_REQUEST` so devices answer without a real password crossing the LAN.
+
+**`testing.py`** — `FakeEvse`, a charger that speaks enough of the protocol to drive a real client. Public so the Home Assistant integration can use it in its own tests.
+
+**`device.py`** — `EvseDevice` is one charger's session and the main consumer API. Updates are pushed to the `on_event(event_type, data)` callback, where `event_type` is the model class name (e.g. `"EvseStatus"`).
+
+**Protocol gotchas**
+- `LOGIN_EVENT` (0x0001) is *not* an error: it is the charger periodically broadcasting its device info (same payload layout as `LOGIN_SUCCESS_EVENT` 0x0002). It arrives whether or not we are logged in, so it says nothing about state; receiving one while logged out triggers an automatic re-login.
+- There is no session. Measured on a Telestar EC311S: a client that never sent `LOGIN_REQUEST` gets `NICKNAME_EVENT` and `OUTPUT_AMPERAGE_EVENT` answered, and the same requests with a wrong password get `PASSWORD_ERROR_EVENT`. Authorisation is per packet — the password sits at bytes 13-19 of *every* packet — so `login()` is a password check and a device-info fetch, not a handshake that unlocks anything.
+- `is_logged_in` therefore needs *both* a successful login and a recent `HEADING_EVENT` (within `SESSION_TIMEOUT`, 30s). The heading half proves the charger is alive; it cannot prove our password is right, because the Telestar *broadcasts* its headings to every host on the LAN. Only the login half does, and the config flow's password validation rests on it.
+- The send port differs per unit and is always learned from the source address — never hard-code it. Observed: Telestar EC311S 21937, BS20 30139, Ocular 46540; `DEFAULT_SEND_PORT` 7248 is only the opening guess. The first `LOGIN_REQUEST` regularly goes to the wrong port and times out; the retry succeeds because an inbound broadcast has taught us the real one in the meantime, which is why the retry loop in `login()` is load-bearing.
+- The Telestar sends `UPLOAD_LOCAL_CHARGE_RECORD` (0x000A) constantly and it is deliberately unhandled.
+- Chargers skip a heading now and then: a Telestar EC311S opened three 20.3s gaps in four minutes of charging, which is why `SESSION_TIMEOUT` is 30s and not emproto's 15s. Too tight a timeout reads a healthy session as dead mid-charge, and `stop_charging` then refuses while the car keeps drawing.
+- A Telestar EC311S applies the output amperage only when a charge *starts*. Mid-charge it echoes a new value back within seconds and then ignores it: the same 16A limit measured 9.3A when set mid-session and 15.3A when the session was restarted with it, on the same car. Lowering additionally faults minutes later. A BS20 reportedly accepts changes mid-charge. There is no way to ask, so it lives in `capabilities.py` and `set_output_amperage` raises `UnsupportedOperationError` instead of sending a command whose acknowledgement means nothing.
+- Every outgoing packet carries the device serial as soon as the first inbound packet binds it; some firmware ignores zero-serial requests.
+- Single-phase chargers send 25-byte status payloads with no L2/L3 block. Some devices also report status under 0x000D and charging status under 0x0006.
 
 **Timezone/clock handling (biggest gotcha)**
-- The EVSE interprets all timestamps as Asia/Shanghai local time; convert with `_datetime_to_shanghai_epoch` / `_shanghai_epoch_to_datetime`.
-- Firmware bug: the device clock can drift by weeks. `_time_delta` is computed from `SYSTEM_TIME_EVENT` responses when skew > 1 day and applied when scheduling charge sessions.
+- The EVSE interprets all timestamps as Asia/Shanghai local time; convert with `_datetime_to_shanghai_epoch` / `_shanghai_epoch_to_datetime` on the device.
+- Firmware bug: the device clock can drift by weeks. `_time_delta` is computed per device from `SYSTEM_TIME_EVENT` responses when skew > 1 day and applied when scheduling charge sessions (exposed as the `time_delta` property).
 - Use `now_aware()` from `data_types`, never naive `datetime.now()` — `start_charging` rejects naive datetimes.
 
 ## Releasing

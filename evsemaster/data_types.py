@@ -1,8 +1,9 @@
-from struct import unpack
 import logging
-from enum import IntEnum
 from datetime import datetime
-from pydantic import BaseModel, Field
+from enum import IntEnum
+from struct import unpack
+
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
 
@@ -15,8 +16,7 @@ def now_aware() -> datetime:
 class BaseSchema(BaseModel):
     """Base schema for all data types."""
 
-    class Config:
-        str_strip_whitespace = True
+    model_config = ConfigDict(str_strip_whitespace=True)
 
 
 class CommandEnum(IntEnum):
@@ -24,7 +24,7 @@ class CommandEnum(IntEnum):
     # event = anything incoming (EVSE -> you), whether it’s a reply or unsolicited
     # response = what you send back to an event that requires it
     # login
-    NOT_LOGGED_IN_EVENT = 0x0001
+    LOGIN_EVENT = 0x0001  # broadcast announcement; carries device info, same layout as LOGIN_SUCCESS_EVENT
     LOGIN_REQUEST = 0x8002
     LOGIN_SUCCESS_EVENT = 0x0002
     LOGIN_CONFIRM_RESPONSE = 0x8001
@@ -41,8 +41,9 @@ class CommandEnum(IntEnum):
     # Status commands
     CURRENT_STATUS_EVENT = 0x0004
     CURRENT_STATUS_RESPONSE = 0x8004
+    REQUEST_STATUS_RECORD = 0x000D  # some devices send status under this command, same layout as 0x0004
     CURRENT_CHARGING_STATUS_EVENT = 0x0005  #  Always incoming, sent automatically by EVSE
-    CURRENT_CHARGING_STATUS_RESPONSE = 0x0006
+    CURRENT_CHARGING_STATUS_EVENT_2 = 0x0006  # also incoming, same layout as 0x0005
 
     # Charge control commands
     CHARGE_START_REQUEST = 0x8007
@@ -70,7 +71,6 @@ class CommandEnum(IntEnum):
     CURRENT_CHARGE_RECORD_REQUEST = 0x800D
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
-    REQUEST_STATUS_RECORD = 0x000D
     POSSIBLE_REPEATED = 270
 
 
@@ -104,6 +104,18 @@ class EvseDeviceInfo(BaseSchema):
     serial_number: str = Field(default="00000000")  # 8 byte hex string
     nickname: str = Field(default="")
     configured_max_amps: int = Field(default=16)  # User-configured max amps
+
+
+class DiscoveredDevice(BaseSchema):
+    """An EVSE seen on the network that is not registered with the listener."""
+
+    serial_number: str
+    host: str
+    port: int
+    brand: str | None = None
+    model: str | None = None
+    hardware_version: str | None = None
+    max_amps: int | None = None
 
 
 class EvseStatus(BaseSchema):
@@ -153,17 +165,23 @@ class DataPacket:
     def __init__(self, data: bytes):
         if data is None or not isinstance(data, bytes):
             raise ValueError("Data must be a non-empty bytes object")
-        if len(data) < 22:
-            raise ValueError("Data must be at least 22 bytes long")
+        if len(data) < 25:
+            raise ValueError("Data must be at least 25 bytes long")
         # Check header
         header = unpack(">H", data[0:2])[0]
         if header != 0x0601:
             raise ValueError(f"Invalid header: {header:#04x}, expected 0x0601")
-        self.command: CommandEnum = CommandEnum(unpack(">H", data[19:21])[0])
-        if self.command not in CommandEnum:
-            raise ValueError(f"Unknown command: {self.command}")
+        raw_command = unpack(">H", data[19:21])[0]
+        try:
+            self.command: CommandEnum = CommandEnum(raw_command)
+        except ValueError:
+            raise ValueError(f"Unknown command: {raw_command:#06x}") from None
         self.device_serial = data[5:13].hex()  # Device serial number
-        self.data = data[21:]  # drop all bytes before the data section
+        # Payload only: drop the 21 byte header and the trailing checksum + tail, so payload
+        # lengths match the protocol (a single-phase status is 25 bytes, three-phase 33).
+        declared = unpack(">H", data[2:4])[0]
+        end = declared if 25 <= declared <= len(data) else len(data)
+        self.data = data[21 : end - 4]
         log.debug(self.__repr__())
 
     def __repr__(self):
@@ -202,5 +220,11 @@ class DataPacket:
 
 class NotLoggedInError(Exception):
     """Exception raised when an operation is attempted without being logged in."""
+
+    pass
+
+
+class UnsupportedOperationError(Exception):
+    """Raised when the charger's model is known to reject an operation in its current state."""
 
     pass

@@ -6,6 +6,8 @@ I'm intenting to keep this a simple implementation, so it does not have all the 
 This is based on the original TypeScript project by [johnwoo-nl](https://github.com/johnwoo-nl/emproto)
 
 ## Currently Implemented
+- Multiple chargers on one UDP socket, routed by device serial
+- Discovery of chargers on the network (they announce themselves; `probe()` asks the ones that don't)
 - Get EVSE device info
 - Get EVSE status
 - Get EVSE charging status
@@ -23,29 +25,51 @@ This is based on the original TypeScript project by [johnwoo-nl](https://github.
 - Connecting to the EVSE via Bluetooth (ie. for connecting the EVSE to wifi)
   * Even though the EVSEMaster app is awful to use, using it once to connect the EVSE to wifi is sufficient for most use cases.
 
-
 ## Usage
-```python
-from evsemaster.evse_protocol import SimpleEVSEProtocol
 
-def event_callback(event, data):
-    print(f"Event: {event}, Data: {data}")
+One `EvseListener` owns the UDP socket; every charger is an `EvseDevice` added to it. Incoming packets
+are routed by the device serial in the packet header, so several chargers can share the one socket.
+
+```python
+import asyncio
+from evsemaster import EvseListener
+
+
+def on_event(event_type, data):
+    print(f"Event: {event_type}, Data: {data}")
+
+
+def on_discovery(discovered):
+    print(f"Found an unconfigured charger: {discovered}")
+
 
 async def main():
-    evse = SimpleEVSEProtocol(
+    listener = EvseListener(on_discovery=on_discovery)
+    await listener.start()
+
+    evse = await listener.async_add_device(
         host="10.0.0.1",  # IP address of the EVSE
         password="123456",  # 6 digit password of the EVSE
-        callback=event_callback,  # Callback function for events
+        on_event=on_event,  # called with every parsed update
     )
-    await evse.connect()  # Connect to the EVSE
-    await evse.request_status() # Request the current status of the EVSE
-    await evse.start_charging()  # Start charging
-    await evse.stop_charging()  # Stop charging
-    await evse.disconnect()  # Disconnect from the EVSE
+    if await evse.login():
+        await evse.request_status()
+        await evse.start_charging()
+        await evse.stop_charging()
+
+    await listener.stop()
+
+
+asyncio.run(main())
 ```
 
-There is a test script `test.py` that can be used to test the library. 
+Chargers broadcast their presence on the listen port (28376), so the library sees a charger before it
+is logged in and re-logs in by itself when a session drops. Make sure those broadcasts can reach you:
+a separate VLAN or a docker bridge network will block them.
+
+There is a test script `test.py` that can be used to test the library, it takes one or more chargers.
 Its a bit messy as it just prints the output while accepting commands, but it can be useful for quick testing.
 ```bash
-poetry run python test.py 10.0.0.1 123456
+poetry run python test.py 10.0.0.1:123456 10.0.0.2:654321
 ```
+Shortcuts: `status`, `start [amps] [YYYY-MM-DDTHH:MM:SS] [minutes]`, `stop`, `discover`, `use <n>`, `all`.
