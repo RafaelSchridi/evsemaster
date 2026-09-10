@@ -67,6 +67,9 @@ Chargers broadcast their presence on the listen port (28376), so the library see
 is logged in and re-logs in by itself when a session drops. Make sure those broadcasts can reach you:
 a separate VLAN or a docker bridge network will block them.
 
+A device counts as logged in while the charger keeps talking to it: `evse.is_logged_in` needs a successful
+login plus a packet other than an announcement within the last 120 seconds (`evse.last_alive`).
+
 There is a test script `test.py` that can be used to test the library, it takes one or more chargers.
 Its a bit messy as it just prints the output while accepting commands, but it can be useful for quick testing.
 ```bash

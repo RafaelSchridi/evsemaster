@@ -51,7 +51,7 @@ async def test_login_learns_the_serial_and_port(device, evse):
     assert device.is_logged_in
     assert device.serial == SERIAL
     assert device.send_port == evse.port
-    assert evse.has_session
+    assert await until(lambda: evse.has_session), "the login confirmation never reached the charger"
 
 
 async def test_every_packet_after_the_first_carries_the_serial(device, evse):
@@ -73,29 +73,25 @@ async def test_the_session_expires_when_the_charger_goes_quiet(device, evse):
     assert await device.login()
     assert device.is_logged_in
 
-    device._last_heading = now_aware() - SESSION_TIMEOUT
-    assert not device.is_logged_in, "a charger that stopped sending headings is not logged in"
+    device._last_alive = now_aware() - SESSION_TIMEOUT
+    assert not device.is_logged_in, "a charger that stopped sending is not logged in"
 
 
 async def test_a_broadcast_while_logged_out_triggers_a_login(device, evse):
     assert await device.login()
     evse.end_session()
-    device._last_heading = None
+    device._last_alive = None
 
     evse.announce()
     assert await until(lambda: device.is_logged_in), "did not log back in by itself"
 
 
-async def test_a_skipped_heading_does_not_drop_the_session(device, evse):
-    """Chargers skip a heading now and then; the session has to ride that out.
-
-    A Telestar EC311S opened 20.3s gaps while charging, and a stop command that lands in one
-    must not be refused.
-    """
+async def test_a_quiet_spell_does_not_drop_the_session(device, evse):
+    """An idle Telestar EC311S went up to 55s between packets; a stop landing in that gap must not be refused."""
     assert await device.login()
 
-    device._last_heading = now_aware() - timedelta(seconds=21)
-    assert device.is_logged_in, "one skipped heading is not a lost session"
+    device._last_alive = now_aware() - timedelta(seconds=55)
+    assert device.is_logged_in, "a quiet spell is not a lost session"
 
 
 async def test_broadcast_headings_alone_do_not_grant_a_session(listener, evse):
@@ -107,15 +103,34 @@ async def test_broadcast_headings_alone_do_not_grant_a_session(listener, evse):
         evse.broadcast_heading()
         await asyncio.sleep(0.05)
 
-    assert device._last_heading is not None, "the headings did arrive"
+    assert device.last_alive is not None, "the headings did arrive"
     assert not device.is_logged_in, "a heading we did not authenticate for is someone else's session"
 
 
 async def test_headings_keep_the_session_alive(device, evse):
     assert await device.login()
-    first = device._last_heading
-    assert await until(lambda: device._last_heading != first)
+    first = device.last_alive
+    assert await until(lambda: device.last_alive != first)
     assert CommandEnum.HEADING_RESPONSE in evse.received
+
+
+async def test_status_traffic_keeps_the_session_alive_without_headings(device, evse):
+    """Idle, the Telestar loses heading beats for up to 90s while its status packets keep coming."""
+    assert await device.login()
+    evse.end_session()  # stops the headings
+    stale = now_aware() - timedelta(seconds=50)
+    device._last_alive = stale
+
+    await device.request_status()
+    assert await until(lambda: device.last_alive != stale)
+    assert device.is_logged_in
+
+
+async def test_announcements_are_not_signs_of_life(listener, evse):
+    # no password, so the announcements cannot trigger an automatic login
+    device = await listener.async_add_device("127.0.0.1", "")
+    assert await until(lambda: device.serial is not None), "an announcement arrived"
+    assert device.last_alive is None
 
 
 async def test_status_and_charging_status_reach_the_consumer(device, evse):

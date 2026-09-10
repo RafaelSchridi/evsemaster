@@ -31,9 +31,8 @@ from .protocol import (
 
 log = logging.getLogger(__name__)
 
-# The EVSE sends a heading every ~10s once it is talking to us, but skips some; no heading
-# for this long means it has stopped answering.
-SESSION_TIMEOUT = timedelta(seconds=30)
+# Any packet but an announcement shows the charger is still talking to us.
+SESSION_TIMEOUT = timedelta(seconds=120)
 LOGIN_RETRY_INTERVAL = 3
 LOGIN_ATTEMPTS = 4
 
@@ -62,7 +61,7 @@ class EvseDevice:
         self._status: EvseStatus | None = None
         self._device_info: EvseDeviceInfo | None = None
         self._charging_status: ChargingStatus | None = None
-        self._last_heading: datetime | None = None
+        self._last_alive: datetime | None = None
         self._authenticated = False
         self._last_seen: datetime | None = None
         self._login_future: asyncio.Future | None = None
@@ -75,15 +74,15 @@ class EvseDevice:
 
     @property
     def is_logged_in(self) -> bool:
-        """Both a successful login and a recent heading.
+        """Both a successful login and recent traffic from the charger.
 
-        The heading half proves the charger is alive but not that our password was accepted:
-        headings are broadcasted to every host on the network.
-        Only the login half proves the password, which is what the config flow checks.
+        Traffic proves the charger is alive but not that our password was accepted: headings are
+        broadcast to every host on the network. Only the login half proves the password, which is
+        what the config flow checks.
         """
-        if not self._authenticated or self._last_heading is None:
+        if not self._authenticated or self._last_alive is None:
             return False
-        return now_aware() - self._last_heading < SESSION_TIMEOUT
+        return now_aware() - self._last_alive < SESSION_TIMEOUT
 
     @property
     def is_charging(self) -> bool:
@@ -94,6 +93,11 @@ class EvseDevice:
     def last_seen(self) -> datetime | None:
         """When we last received any packet from this device."""
         return self._last_seen
+
+    @property
+    def last_alive(self) -> datetime | None:
+        """When the charger last sent anything other than an announcement."""
+        return self._last_alive
 
     @property
     def capabilities(self) -> Capabilities:
@@ -174,12 +178,14 @@ class EvseDevice:
     async def _handle_packet(self, packet: DataPacket) -> None:
         """Dispatch one routed packet."""
         cmd = packet.command
+        if cmd != CommandEnum.LOGIN_EVENT:
+            # proves the charger is alive, but not that our password was accepted
+            self._last_alive = now_aware()
         try:
             if cmd == CommandEnum.LOGIN_SUCCESS_EVENT:
                 self._update_device_info(parse_device_info(packet))
                 self.send_command(CommandEnum.LOGIN_CONFIRM_RESPONSE)
                 self._authenticated = True
-                self._last_heading = now_aware()
                 if self._login_future and not self._login_future.done():
                     self._login_future.set_result(True)
             elif cmd == CommandEnum.LOGIN_EVENT:
@@ -191,11 +197,10 @@ class EvseDevice:
             elif cmd == CommandEnum.PASSWORD_ERROR_EVENT:
                 log.error("Password error for %s", self)
                 self._authenticated = False
-                self._last_heading = None
+                self._last_alive = None
                 if self._login_future and not self._login_future.done():
                     self._login_future.set_result(False)
             elif cmd == CommandEnum.HEADING_EVENT:
-                self._last_heading = now_aware()
                 self.send_command(CommandEnum.HEADING_RESPONSE)
             elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
                 self._update_status(packet)
