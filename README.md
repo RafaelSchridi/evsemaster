@@ -25,6 +25,14 @@ This is based on the original TypeScript project by [johnwoo-nl](https://github.
 - Connecting to the EVSE via Bluetooth (ie. for connecting the EVSE to wifi)
   * Even though the EVSEMaster app is awful to use, using it once to connect the EVSE to wifi is sufficient for most use cases.
 
+## Installation
+
+Published on PyPI as [evsemaster](https://pypi.org/project/evsemaster/); requires Python 3.14 or newer.
+
+```bash
+pip install evsemaster
+```
+
 ## Usage
 
 One `EvseListener` owns the UDP socket; every charger is an `EvseDevice` added to it. Incoming packets
