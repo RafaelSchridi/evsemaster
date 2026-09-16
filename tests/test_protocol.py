@@ -84,8 +84,10 @@ def test_a_bad_checksum_is_logged_but_the_packet_is_kept(caplog):
         packet = DataPacket(bytes(raw))
         DataPacket(bytes(raw))
 
+    mismatches = [r for r in caplog.records if "mismatch" in r.getMessage()]
     assert packet.command is CommandEnum.HEADING_EVENT, "a bad checksum must not cost the packet"
-    assert caplog.text.count("mismatch") == 1, "a charger that mismatches does it on every packet"
+    assert sum(r.levelno == logging.WARNING for r in mismatches) == 1, "a mismatching charger does it every packet"
+    assert sum(r.levelno == logging.DEBUG for r in mismatches) == 2, "debug logging must show every occurrence"
 
 
 def test_short_and_malformed_packets_are_rejected():

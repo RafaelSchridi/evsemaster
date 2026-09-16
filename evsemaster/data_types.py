@@ -181,6 +181,22 @@ class ChargingStatus(BaseSchema):
     charge_fee: float
 
 
+def _log_mismatch(command: CommandEnum, checksum: int, tail: int, declared: int, received: int) -> None:
+    """Every occurrence at debug; the first per command at warning."""
+    log.debug(
+        "Checksum/tail mismatch on %s: checksum %#06x, tail %#06x, declared %d bytes, received %d",
+        command.name,
+        checksum,
+        tail,
+        declared,
+        received,
+    )
+    if command in _mismatched:
+        return
+    _mismatched.add(command)
+    log.warning("Checksum/tail mismatch on %s, please report it with your charger model", command.name)
+
+
 class DataPacket:
     """Class for incoming data with unpack functions."""
 
@@ -210,11 +226,9 @@ class DataPacket:
         # Payload only: drop the 21 byte header and the trailing checksum + tail
         self.data = data[21 : end - 4]
         checksum, tail = unpack(">HH", data[end - 4 : end])
-        mismatch = tail != CommandEnum.TAIL or checksum != sum(data[: end - 4]) % 0xFFFF
-        # never rejected, and once per command: firmware that gets this wrong gets it wrong every packet
-        if mismatch and self.command not in _mismatched:
-            _mismatched.add(self.command)
-            log.warning("Checksum/tail mismatch on %s: %#06x/%#06x", self.command.name, checksum, tail)
+        # log only for now, no rejection
+        if tail != CommandEnum.TAIL or checksum != sum(data[: end - 4]) % 0xFFFF:
+            _log_mismatch(self.command, checksum, tail, declared, len(data))
         log.debug(self.__repr__())
 
     def __repr__(self):
