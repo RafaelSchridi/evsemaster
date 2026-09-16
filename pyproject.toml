@@ -34,7 +34,8 @@ target-version = "py314"
 # https://docs.astral.sh/ruff/rules/
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 ignore = [
-    "SIM103",
+    "SIM103", 
+    "SIM108",
 ]
 
 [tool.pytest.ini_options]

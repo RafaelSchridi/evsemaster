@@ -6,6 +6,7 @@ import zoneinfo
 from datetime import datetime
 
 from .data_types import (
+    ENVELOPE_SIZE,
     ChargingStatus,
     CommandEnum,
     DataPacket,
@@ -17,7 +18,6 @@ from .data_types import (
 log = logging.getLogger(__name__)
 
 ZERO_SERIAL = "0000000000000000"
-
 SHANGHAI_TZ = zoneinfo.ZoneInfo("Asia/Shanghai")
 
 
@@ -31,7 +31,7 @@ def shanghai_offset() -> int:
 
 def build_packet(cmd: CommandEnum, serial: str | None, password: str | None, payload: bytes = b"") -> bytes:
     """Build a packet for the given command; serial and password may be empty for a probe."""
-    packet = bytearray(25 + len(payload))
+    packet = bytearray(ENVELOPE_SIZE + len(payload))
 
     # Header
     struct.pack_into(">H", packet, 0, CommandEnum.HEADER)
@@ -117,10 +117,7 @@ def parse_device_info(packet: DataPacket) -> EvseDeviceInfo | None:
 
 
 def parse_status(packet: DataPacket) -> EvseStatus | None:
-    """Parse an EVSE status payload.
-
-    Single-phase chargers send 25 bytes and omit the L2/L3 block entirely.
-    """
+    """Parse an EVSE status payload."""
     if packet.length() < 25:
         return None
     three_phase = packet.length() >= 33

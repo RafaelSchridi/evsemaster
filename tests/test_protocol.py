@@ -1,12 +1,13 @@
 """Packet codec and payload parsing."""
 
+import logging
 import struct
 from datetime import timedelta
 
 import pytest
 
 from evsemaster import CommandEnum, DataPacket
-from evsemaster.data_types import now_aware
+from evsemaster.data_types import _mismatched, now_aware
 from evsemaster.protocol import (
     build_packet,
     build_start_charging_payload,
@@ -71,6 +72,20 @@ def test_unknown_command_dumps_the_packet_without_the_password():
     assert "abcd" in str(err.value), "payload bytes missing from the dump"
     assert SERIAL in str(err.value), "serial missing from the dump"
     assert "313233343536" not in str(err.value), "password leaked into the dump"
+
+
+def test_a_bad_checksum_is_logged_but_the_packet_is_kept(caplog):
+    """UDP already checksums every datagram; this only tells us whether chargers ever disagree."""
+    raw = bytearray(build_packet(CommandEnum.HEADING_EVENT, SERIAL, "123456", b"\x01"))
+    raw[21] ^= 0xFF  # payload byte, so the checksum no longer covers it
+    _mismatched.discard(CommandEnum.HEADING_EVENT)  # warned once per command, for the life of the process
+
+    with caplog.at_level(logging.DEBUG, logger="evsemaster.data_types"):
+        packet = DataPacket(bytes(raw))
+        DataPacket(bytes(raw))
+
+    assert packet.command is CommandEnum.HEADING_EVENT, "a bad checksum must not cost the packet"
+    assert caplog.text.count("mismatch") == 1, "a charger that mismatches does it on every packet"
 
 
 def test_short_and_malformed_packets_are_rejected():

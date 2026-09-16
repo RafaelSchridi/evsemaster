@@ -8,6 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field
 log = logging.getLogger(__name__)
 
 _unmapped: set[tuple[type, int]] = set()
+# 21 byte header plus the 4 byte checksum and tail: the smallest a packet can be, payload or not
+ENVELOPE_SIZE = 25
+
+_mismatched: set[CommandEnum] = set()
 
 
 def now_aware() -> datetime:
@@ -178,17 +182,17 @@ class ChargingStatus(BaseSchema):
 
 
 class DataPacket:
-    """Class for incomind data with unpack functions."""
+    """Class for incoming data with unpack functions."""
 
     def __init__(self, data: bytes):
         if data is None or not isinstance(data, bytes):
             raise ValueError("Data must be a non-empty bytes object")
-        if len(data) < 25:
-            raise ValueError("Data must be at least 25 bytes long")
+        if len(data) < ENVELOPE_SIZE:
+            raise ValueError(f"Data must be at least {ENVELOPE_SIZE} bytes long")
         # Check header
         header = unpack(">H", data[0:2])[0]
-        if header != 0x0601:
-            raise ValueError(f"Invalid header: {header:#04x}, expected 0x0601")
+        if header != CommandEnum.HEADER:
+            raise ValueError(f"Invalid header: {header:#06x}, expected {CommandEnum.HEADER:#06x}")
         raw_command = unpack(">H", data[19:21])[0]
         try:
             self.command: CommandEnum = CommandEnum(raw_command)
@@ -197,11 +201,20 @@ class DataPacket:
             dump = data[:13].hex() + "xxxxxxxxxxxx" + data[19:].hex()
             raise ValueError(f"Unknown command: {raw_command:#06x}, {len(data)} bytes: {dump}") from None
         self.device_serial = data[5:13].hex()  # Device serial number
-        # Payload only: drop the 21 byte header and the trailing checksum + tail, so payload
-        # lengths match the protocol (a single-phase status is 25 bytes, three-phase 33).
         declared = unpack(">H", data[2:4])[0]
-        end = declared if 25 <= declared <= len(data) else len(data)
+        # a length shorter than the envelope, or longer than what arrived, cannot be the real end
+        if declared >= ENVELOPE_SIZE and declared <= len(data):
+            end = declared
+        else:
+            end = len(data)
+        # Payload only: drop the 21 byte header and the trailing checksum + tail
         self.data = data[21 : end - 4]
+        checksum, tail = unpack(">HH", data[end - 4 : end])
+        mismatch = tail != CommandEnum.TAIL or checksum != sum(data[: end - 4]) % 0xFFFF
+        # never rejected, and once per command: firmware that gets this wrong gets it wrong every packet
+        if mismatch and self.command not in _mismatched:
+            _mismatched.add(self.command)
+            log.warning("Checksum/tail mismatch on %s: %#06x/%#06x", self.command.name, checksum, tail)
         log.debug(self.__repr__())
 
     def __repr__(self):
