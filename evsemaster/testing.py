@@ -80,6 +80,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         brand: str = "BESEN",
         model: str = "BS20",
         state: int = 13,
+        plug: int = 4,
         announce_interval: float = 0.5,
         heading_interval: float = 1.0,
     ):
@@ -94,6 +95,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         self.brand = brand
         self.model = model
         self.state = state
+        self.plug = plug
         self.announce_interval = announce_interval
         self.heading_interval = heading_interval
         self.received: list[CommandEnum] = []
@@ -179,7 +181,9 @@ class FakeEvse(asyncio.DatagramProtocol):
             if not self._heading_task:
                 self._heading_task = asyncio.create_task(self._headings())
         elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
-            self.send(CommandEnum.CURRENT_STATUS_EVENT, status_payload(self.three_phase, state=self.state))
+            self.send(
+                CommandEnum.CURRENT_STATUS_EVENT, status_payload(self.three_phase, state=self.state, plug=self.plug)
+            )
             self.send(CommandEnum.CURRENT_CHARGING_STATUS_EVENT, charging_payload())
         elif cmd == CommandEnum.SYSTEM_TIME_REQUEST:
             self.send(CommandEnum.SYSTEM_TIME_EVENT, payload[:5])

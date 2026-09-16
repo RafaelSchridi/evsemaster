@@ -48,6 +48,7 @@ Modules in `evsemaster/`:
 - A pending reservation reports `CHARGING_RESERVATION` even with no car plugged in (Telestar EC311S), so `NOT_CONNECTED` means nothing is scheduled and `start_charging`'s cancel-first check still fires when re-reserving.
 - Every outgoing packet carries the device serial as soon as the first inbound packet binds it; some firmware ignores zero-serial requests.
 - Single-phase chargers send 25-byte status payloads with no L2/L3 block. Some devices also report status under 0x000D and charging status under 0x0006.
+- State enums are tolerant, commands are not. `PlugStateEnum`/`CurrentStateEnum` inherit `FirmwareEnum`, whose `_missing_` maps an unmapped value to `UNKNOWN` (999, out of reach of the byte it is read from) and warns once per value: a BS20 reports plug state 16, and strict enums cost the whole packet (all 16 status fields) over that one byte. `CommandEnum` stays strict, but `DataPacket` now raises with a hex dump of the packet with the password bytes masked, so an unknown command can be decoded from a debug log someone pastes into an issue.
 
 **Timezone/clock handling (biggest gotcha)**
 - The EVSE interprets all timestamps as Asia/Shanghai local time; convert with `_datetime_to_shanghai_epoch` / `_shanghai_epoch_to_datetime` on the device.

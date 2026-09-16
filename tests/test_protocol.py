@@ -61,6 +61,18 @@ def test_unknown_command_is_rejected_with_its_value():
         DataPacket(bytes(raw))
 
 
+def test_unknown_command_dumps_the_packet_without_the_password():
+    """The dump is what a reporter pastes into an issue, so it must carry the bytes and not the password."""
+    raw = bytearray(build_packet(CommandEnum.LOGIN_REQUEST, SERIAL, "123456", b"\xab\xcd"))
+    struct.pack_into(">H", raw, 19, 0x0162)
+    with pytest.raises(ValueError) as err:
+        DataPacket(bytes(raw))
+
+    assert "abcd" in str(err.value), "payload bytes missing from the dump"
+    assert SERIAL in str(err.value), "serial missing from the dump"
+    assert "313233343536" not in str(err.value), "password leaked into the dump"
+
+
 def test_short_and_malformed_packets_are_rejected():
     with pytest.raises(ValueError):
         DataPacket(b"\x06\x01" + bytes(10))
@@ -86,6 +98,15 @@ def test_status_of_a_single_phase_charger():
     for field in ("l1_voltage", "l1_amps", "current_power", "total_kwh", "current_state", "plug_state"):
         assert getattr(single, field) == getattr(three, field)
     assert (single.l2_voltage, single.l2_amps, single.l3_voltage, single.l3_amps) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_unmapped_state_values_keep_the_rest_of_the_status():
+    """A BS20 reports plug state 16; strict enums used to discard all 16 fields over it."""
+    status = parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, status_payload(plug=16, state=200)))
+    assert status is not None, "the packet was discarded over one unmapped byte"
+    assert status.plug_state.name == "UNKNOWN"
+    assert status.current_state.name == "UNKNOWN"
+    assert (status.l1_voltage, status.l1_amps) == (230.1, 16.0)
 
 
 def test_status_too_short_to_parse_is_dropped():

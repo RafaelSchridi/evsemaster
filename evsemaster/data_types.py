@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger(__name__)
 
+_unmapped: set[tuple[type, int]] = set()
+
 
 def now_aware() -> datetime:
     """Get the current datetime with timezone info."""
@@ -74,13 +76,29 @@ class CommandEnum(IntEnum):
     POSSIBLE_REPEATED = 270
 
 
-class PlugStateEnum(IntEnum):
+class FirmwareEnum(IntEnum):
+    """Base without members, so subclasses can declare their own.
+
+    Firmware reports values we have not mapped; one unknown byte must not cost the whole packet.
+    """
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, int) and (cls, value) not in _unmapped:
+            _unmapped.add((cls, value))
+            log.warning("Unmapped %s value %s, please report it with your charger model", cls.__name__, value)
+        return cls.UNKNOWN
+
+
+class PlugStateEnum(FirmwareEnum):
+    UNKNOWN = 999
     DISCONNECTED = 1
     CONNECTED_UNLOCKED = 2
     CONNECTED_LOCKED = 4
 
 
-class CurrentStateEnum(IntEnum):
+class CurrentStateEnum(FirmwareEnum):
+    UNKNOWN = 999
     EVSE_FAULT = 1
     CHARGING_FAULT_2 = 2
     CHARGING_FAULT_3 = 3
@@ -175,7 +193,9 @@ class DataPacket:
         try:
             self.command: CommandEnum = CommandEnum(raw_command)
         except ValueError:
-            raise ValueError(f"Unknown command: {raw_command:#06x}") from None
+            # dumped so it can be decoded from an issue report; the password at 13:19 is masked out
+            dump = data[:13].hex() + "xxxxxxxxxxxx" + data[19:].hex()
+            raise ValueError(f"Unknown command: {raw_command:#06x}, {len(data)} bytes: {dump}") from None
         self.device_serial = data[5:13].hex()  # Device serial number
         # Payload only: drop the 21 byte header and the trailing checksum + tail, so payload
         # lengths match the protocol (a single-phase status is 25 bytes, three-phase 33).

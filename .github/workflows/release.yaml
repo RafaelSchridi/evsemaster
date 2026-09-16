@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # OIDC for PyPI; no token in secrets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pipx install poetry
+      - run: poetry install
+      - run: poetry run ruff check
+      - run: poetry run pytest
+      - name: Tag must match pyproject version
+        run: |
+          version=$(poetry version --short)
+          [ "$GITHUB_REF_NAME" = "$version" ] || { echo "tag $GITHUB_REF_NAME != pyproject $version"; exit 1; }
+      - run: poetry build
+      - uses: pypa/gh-action-pypi-publish@release/v1
