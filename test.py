@@ -32,7 +32,7 @@ async def periodic_status(devices: list[EvseDevice], interval: int = 60):
         while True:
             await asyncio.sleep(interval)
             for device in devices:
-                if device.is_logged_in:
+                if device.is_authorised:
                     await device.request_status()
     except asyncio.CancelledError:
         return
@@ -96,7 +96,7 @@ async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
             print("Shortcuts: status, start [amps] [YYYY-MM-DDTHH:MM:SS] [minutes], stop, discover")
             print(f"Targets: use <1-{len(devices)}>, all")
             for i, device in enumerate(devices, 1):
-                print(f"  {i}. {device} logged_in={device.is_logged_in}")
+                print(f"  {i}. {device} authorised={device.is_authorised} receiving={device.is_receiving}")
             continue
         if cmd_str == "all":
             targets = list(devices)

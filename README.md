@@ -1,6 +1,6 @@
 # evsemaster
 
-Async Python client for EVSE chargers that speak the EVSEMaster app's UDP protocol, as used by
+Unofficial Async Python client for EVSE chargers that speak the EVSEMaster app's UDP protocol, as used by
 Besen, Telestar, evseODM, Morec, Deltacom and other rebrands of the same hardware.
 
 > **Using Home Assistant?** You probably want the

@@ -7,7 +7,7 @@ import pytest
 
 from evsemaster import CommandEnum, EvseListener, NotLoggedInError, now_aware
 from evsemaster.data_types import CurrentStateEnum, UnsupportedOperationError
-from evsemaster.device import SESSION_TIMEOUT
+from evsemaster.device import HEADING_TIMEOUT
 from evsemaster.testing import FakeEvse
 
 SERIAL = "aa" * 8
@@ -48,7 +48,7 @@ async def device(listener, evse):
 
 async def test_login_learns_the_serial_and_port(device, evse):
     assert await device.login()
-    assert device.is_logged_in
+    assert device.is_receiving
     assert device.serial == SERIAL
     assert device.send_port == evse.port
     assert await until(lambda: evse.has_session), "the login confirmation never reached the charger"
@@ -65,33 +65,35 @@ async def test_a_wrong_password_fails_the_login_without_retrying_forever(listene
     device = await listener.async_add_device("127.0.0.1", "000000")
     assert await until(lambda: device.serial == SERIAL)  # learned from the announcement
     assert await device.login() is False
-    assert not device.is_logged_in
+    assert not device.is_authorised
     assert CommandEnum.LOGIN_REQUEST in evse.received
 
 
-async def test_the_session_expires_when_the_charger_goes_quiet(device, evse):
+async def test_the_registration_expires_when_the_headings_stop(device, evse):
     assert await device.login()
-    assert device.is_logged_in
+    assert device.is_receiving
 
-    device._last_alive = now_aware() - SESSION_TIMEOUT
-    assert not device.is_logged_in, "a charger that stopped sending is not logged in"
+    device._last_heading = now_aware() - HEADING_TIMEOUT
+    assert not device.is_receiving, "a charger that stopped heading has dropped us"
+    assert device.is_authorised, "but the password is still right"
 
 
-async def test_a_broadcast_while_logged_out_triggers_a_login(device, evse):
+async def test_a_broadcast_while_unregistered_triggers_a_login(device, evse):
     assert await device.login()
     evse.end_session()
-    device._last_alive = None
+    device._last_heading = None
+    device._last_login_attempt = None  # as if the cooldown had elapsed
 
     evse.announce()
-    assert await until(lambda: device.is_logged_in), "did not log back in by itself"
+    assert await until(lambda: device.is_receiving), "did not log back in by itself"
 
 
-async def test_a_quiet_spell_does_not_drop_the_session(device, evse):
-    """An idle Telestar EC311S went up to 55s between packets; a stop landing in that gap must not be refused."""
+async def test_a_missed_heading_beat_does_not_drop_the_registration(device, evse):
+    """Beats arrived ~100% of the time over 20.7 hours, but a stop landing in a gap must not be refused."""
     assert await device.login()
 
-    device._last_alive = now_aware() - timedelta(seconds=55)
-    assert device.is_logged_in, "a quiet spell is not a lost session"
+    device._last_heading = now_aware() - timedelta(seconds=20)
+    assert device.is_receiving, "two missed beats is not a lost registration"
 
 
 async def test_broadcast_headings_alone_do_not_grant_a_session(listener, evse):
@@ -104,26 +106,47 @@ async def test_broadcast_headings_alone_do_not_grant_a_session(listener, evse):
         await asyncio.sleep(0.05)
 
     assert device.last_alive is not None, "the headings did arrive"
-    assert not device.is_logged_in, "a heading we did not authenticate for is someone else's session"
+    assert not device.is_receiving, "a heading we did not authenticate for is someone else's session"
 
 
-async def test_headings_keep_the_session_alive(device, evse):
+async def test_headings_hold_the_registration_open(device, evse):
     assert await device.login()
-    first = device.last_alive
-    assert await until(lambda: device.last_alive != first)
+    first = device.last_heading
+    assert await until(lambda: device.last_heading != first)
     assert CommandEnum.HEADING_RESPONSE in evse.received
 
 
-async def test_status_traffic_keeps_the_session_alive_without_headings(device, evse):
-    """Idle, the Telestar loses heading beats for up to 90s while its status packets keep coming."""
+async def test_an_answered_poll_is_not_proof_of_a_registration(device, evse):
+    """A charger answers requests whether or not it still counts us as its client.
+
+    Judging liveness on any traffic made a two hour outage look healthy: the watchdog's own
+    answered poll kept refreshing the timestamp that decides whether to log in again.
+    """
     assert await device.login()
-    evse.end_session()  # stops the headings
+    evse.end_session()
+    device._last_heading = now_aware() - HEADING_TIMEOUT
     stale = now_aware() - timedelta(seconds=50)
     device._last_alive = stale
 
     await device.request_status()
-    assert await until(lambda: device.last_alive != stale)
-    assert device.is_logged_in
+    assert await until(lambda: device.last_alive != stale), "the charger did answer"
+    assert not device.is_receiving, "an answered poll is not a registration"
+
+
+async def test_a_charger_that_answers_but_stops_heading_is_registered_again(device, evse):
+    """2026-09-18: a charger answered every poll for two hours while heading nobody.
+
+    Its answers kept the old any-traffic liveness fresh, so the automatic re-login never
+    fired and the integration served a two hour old snapshot as current.
+    """
+    assert await device.login()
+    evse.end_session()
+    device._last_heading = now_aware() - HEADING_TIMEOUT
+    device._last_login_attempt = None  # as if the cooldown had elapsed
+
+    await device.request_status()
+    assert await until(lambda: evse.has_session), "never registered with the charger again"
+    assert await until(lambda: device.is_receiving)
 
 
 async def test_announcements_are_not_signs_of_life(listener, evse):
@@ -142,13 +165,24 @@ async def test_status_and_charging_status_reach_the_consumer(device, evse):
 
 
 @pytest.mark.parametrize("command", ["request_status", "start_charging", "stop_charging", "set_nickname"])
-async def test_commands_are_refused_while_logged_out(listener, evse, command):
+async def test_commands_are_refused_until_a_login_succeeds(listener, evse, command):
     # no password, so it never logs itself in when the charger announces
     device = await listener.async_add_device("127.0.0.1", "")
-    assert not device.is_logged_in
+    assert not device.is_authorised
     args = ("Shed",) if command == "set_nickname" else ()
     with pytest.raises(NotLoggedInError):
         await getattr(device, command)(*args)
+
+
+@pytest.mark.parametrize("command", ["request_status", "stop_charging"])
+async def test_commands_still_work_after_the_charger_drops_us(device, evse, command):
+    """Authorisation is per packet, so a stop refused while the car draws is worse than stale data."""
+    assert await device.login()
+    evse.end_session()
+    device._last_heading = now_aware() - HEADING_TIMEOUT
+    assert not device.is_receiving
+
+    assert await getattr(device, command)()
 
 
 async def test_start_charging_validates_against_the_device_limits(device, evse):

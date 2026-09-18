@@ -147,10 +147,10 @@ class FakeEvse(asyncio.DatagramProtocol):
         )
 
     def broadcast_heading(self) -> None:
-        """A heading sent to the network at large, with no session behind it.
+        """A heading arriving with no registration of ours behind it.
 
-        Telestar EC311S firmware broadcasts its session headings instead of unicasting them, so
-        every host on the LAN sees the headings of whichever client actually holds the session.
+        Whether firmware unicasts headings to its client or broadcasts them is unconfirmed, so a
+        client must not read one as proof that the registration is its own.
         """
         self.transport.sendto(
             build_packet(CommandEnum.HEADING_EVENT, self.serial, ""),

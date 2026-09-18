@@ -31,8 +31,12 @@ from .protocol import (
 
 log = logging.getLogger(__name__)
 
-# Any packet but an announcement shows the charger is still talking to us.
-SESSION_TIMEOUT = timedelta(seconds=120)
+# A charger heads every ~10s, and only while it still counts us as its client. Three missed
+# beats means it has dropped us; nothing else proves otherwise, because an answer to a
+# request we sent shows only that it is reachable.
+HEADING_TIMEOUT = timedelta(seconds=35)
+# A charger with no client announces every 3s; without this, one failing login retries on each.
+LOGIN_COOLDOWN = timedelta(seconds=15)
 LOGIN_RETRY_INTERVAL = 3
 LOGIN_ATTEMPTS = 4
 
@@ -62,6 +66,8 @@ class EvseDevice:
         self._device_info: EvseDeviceInfo | None = None
         self._charging_status: ChargingStatus | None = None
         self._last_alive: datetime | None = None
+        self._last_heading: datetime | None = None
+        self._last_login_attempt: datetime | None = None
         self._authenticated = False
         self._last_seen: datetime | None = None
         self._login_future: asyncio.Future | None = None
@@ -73,16 +79,30 @@ class EvseDevice:
         return f"EvseDevice({self.serial or self.host}@{self.host_ip}:{self.send_port})"
 
     @property
-    def is_logged_in(self) -> bool:
-        """Both a successful login and recent traffic from the charger.
+    def is_authorised(self) -> bool:
+        """A login succeeded, so the charger will act on our commands.
 
-        Traffic proves the charger is alive but not that our password was accepted: headings are
-        broadcast to every host on the network. Only the login half proves the password, which is
-        what the config flow checks.
+        This does not expire: the password rides in every packet, so authorisation is per
+        packet and a charger that stopped reporting still accepts a stop.
         """
-        if not self._authenticated or self._last_alive is None:
+        return self._authenticated
+
+    @property
+    def is_receiving(self) -> bool:
+        """The charger still counts us as its client, so the data we hold is current.
+
+        Judged on headings alone. A charger emits them only while it holds a registration,
+        and it is the one packet we never request, so it can never be an answer to our own
+        poll. Any-traffic liveness reads a dropped registration as healthy.
+        """
+        if not self._authenticated or self._last_heading is None:
             return False
-        return now_aware() - self._last_alive < SESSION_TIMEOUT
+        return now_aware() - self._last_heading < HEADING_TIMEOUT
+
+    @property
+    def is_logged_in(self) -> bool:
+        """Deprecated alias for `is_receiving`; incorrect terminology for what it measures"""
+        return self.is_receiving
 
     @property
     def is_charging(self) -> bool:
@@ -98,6 +118,11 @@ class EvseDevice:
     def last_alive(self) -> datetime | None:
         """When the charger last sent anything other than an announcement."""
         return self._last_alive
+
+    @property
+    def last_heading(self) -> datetime | None:
+        """When the charger last headed us, which is what holds the registration open."""
+        return self._last_heading
 
     @property
     def capabilities(self) -> Capabilities:
@@ -122,12 +147,20 @@ class EvseDevice:
             except Exception as e:
                 log.error(f"Error in event callback: {e}")
 
+    def _may_attempt_login(self) -> bool:
+        """Throttle the 3s announcement beat down to one attempt per cooldown."""
+        if self._login_lock.locked():
+            return False
+        last = self._last_login_attempt
+        return last is None or now_aware() - last >= LOGIN_COOLDOWN
+
     async def login(self) -> bool:
         """Log in, retrying the request until the EVSE answers."""
         if self._login_lock.locked():
             log.debug("Login already in progress for %s", self)
-            return self.is_logged_in
+            return self.is_receiving
         async with self._login_lock:
+            self._last_login_attempt = now_aware()
             loop = asyncio.get_running_loop()
             self._login_future = loop.create_future()
             try:
@@ -179,29 +212,32 @@ class EvseDevice:
         """Dispatch one routed packet."""
         cmd = packet.command
         if cmd != CommandEnum.LOGIN_EVENT:
-            # proves the charger is alive, but not that our password was accepted
             self._last_alive = now_aware()
         try:
-            if cmd == CommandEnum.LOGIN_SUCCESS_EVENT:
+            if cmd == CommandEnum.HEADING_EVENT:
+                self._last_heading = now_aware()
+                self.send_command(CommandEnum.HEADING_RESPONSE)
+            elif cmd == CommandEnum.LOGIN_SUCCESS_EVENT:
                 self._update_device_info(parse_device_info(packet))
                 self.send_command(CommandEnum.LOGIN_CONFIRM_RESPONSE)
                 self._authenticated = True
+                # the handshake is what registers us, so it opens the heading window itself
+                self._last_heading = now_aware()
                 if self._login_future and not self._login_future.done():
                     self._login_future.set_result(True)
             elif cmd == CommandEnum.LOGIN_EVENT:
-                # Periodic broadcast announcement; arrives whether or not we are logged in.
+                # A charger announces only while it has no client, so this contradicts a registration.
                 self._update_device_info(parse_device_info(packet))
-                if self.password and not self.is_logged_in and not self._login_lock.locked():
-                    log.info("%s announced itself while logged out, logging in", self)
+                if self.password and not self.is_receiving and self._may_attempt_login():
+                    log.info("%s announced itself while we hold no registration, logging in", self)
                     self._auto_login_task = asyncio.create_task(self.login())
             elif cmd == CommandEnum.PASSWORD_ERROR_EVENT:
                 log.error("Password error for %s", self)
                 self._authenticated = False
                 self._last_alive = None
+                self._last_heading = None
                 if self._login_future and not self._login_future.done():
                     self._login_future.set_result(False)
-            elif cmd == CommandEnum.HEADING_EVENT:
-                self.send_command(CommandEnum.HEADING_RESPONSE)
             elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
                 self._update_status(packet)
                 self.send_command(CommandEnum.CURRENT_STATUS_RESPONSE)
@@ -276,7 +312,7 @@ class EvseDevice:
 
     async def request_status(self) -> bool:
         """Request current EVSE status."""
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before requesting status")
         self.send_command(CommandEnum.CURRENT_STATUS_EVENT)
         # get device time
@@ -285,7 +321,7 @@ class EvseDevice:
 
     async def request_essentials(self) -> bool:
         """Send some commands to get basic info and sync device time."""
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before getting essentials")
         # Sync device time first to ensure correct timestamps
         await self.set_device_time()
@@ -306,7 +342,7 @@ class EvseDevice:
         start_date: schedule start (now if None)
         duration_minutes: max duration (65535 = unlimited)
         """
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before starting charge")
         if not self._device_info:
             raise NotLoggedInError("No device info yet, cannot validate charge parameters")
@@ -350,14 +386,14 @@ class EvseDevice:
 
     async def stop_charging(self) -> bool:
         """Send stop charging request."""
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before stopping charge")
         self.send_command(CommandEnum.CHARGE_STOP_REQUEST, bytes([1]))  # port id
         return True
 
     async def set_nickname(self, nickname: str) -> bool:
         """Set the EVSE nickname."""
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before setting nickname")
 
         max_display_nickname = 28
@@ -379,7 +415,7 @@ class EvseDevice:
 
     async def set_output_amperage(self, amperage: int) -> bool:
         """Set the EVSE output amperage limit."""
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before setting output amperage")
         if amperage < 6 or amperage > 32:
             raise ValueError("Amperage must be between 6 and 32")
@@ -406,7 +442,7 @@ class EvseDevice:
         The device stores time in a weird way - we need to calculate the offset
         between local timezone and Shanghai timezone and apply it to the timestamp.
         """
-        if not self.is_logged_in:
+        if not self.is_authorised:
             raise NotLoggedInError("Please login before setting device time")
 
         if not dt:
