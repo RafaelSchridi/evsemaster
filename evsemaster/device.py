@@ -89,7 +89,7 @@ class EvseDevice:
 
     @property
     def is_receiving(self) -> bool:
-        """The charger still counts us as its client, so the data we hold is current.
+        """We logged in and the charger still holds a registration, so the data we hold is current.
 
         Judged on headings alone. A charger emits them only while it holds a registration,
         and it is the one packet we never request, so it can never be an answer to our own

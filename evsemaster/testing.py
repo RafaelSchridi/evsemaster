@@ -149,7 +149,7 @@ class FakeEvse(asyncio.DatagramProtocol):
     def broadcast_heading(self) -> None:
         """A heading arriving with no registration of ours behind it.
 
-        Whether firmware unicasts headings to its client or broadcasts them is unconfirmed, so a
+        Firmware broadcasts headings, so another client's registration delivers them too; a
         client must not read one as proof that the registration is its own.
         """
         self.transport.sendto(

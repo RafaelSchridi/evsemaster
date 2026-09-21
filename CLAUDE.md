@@ -10,10 +10,12 @@ EVSEMaster app, speaking its reverse-engineered UDP protocol (after the TypeScri
 that consumes it lives in the sibling repo `RafaelSchridi/evsemaster-homeassistant` — see its
 CLAUDE.md for the cross-repo workflow.
 
-Two companion docs carry detail this file deliberately does not repeat:
+Three companion docs carry detail this file deliberately does not repeat:
 
 - `docs/device-behaviour.md` — what a charger does on the wire, with measurements. **Read it
   before touching session or protocol code.**
+- `docs/protocol.md` — frame, command table and payload layouts, each marked with its source
+  (wire capture, vendor app, or emproto).
 - `TODO.md` — ranked open work, including known bugs and an unfixed credential leak.
 
 ## Commands
@@ -69,8 +71,12 @@ fixture; never bind 28376 in a test.
 
 - The EVSE interprets all timestamps as Asia/Shanghai local time; convert with
   `_datetime_to_shanghai_epoch` / `_shanghai_epoch_to_datetime` on the device.
-- The device clock drifts by weeks. `_time_delta` is computed per device from
-  `SYSTEM_TIME_EVENT` when skew > 1 day and applied when scheduling.
+- Nothing corrects the device clock on its own, so a charger no client has ever set can be weeks out.
+  `set_device_time` runs on every login for that reason.
+- **A charger can run a month ahead and act on it**, and writing the clock does not clear it — the set reply comes
+  back skewed. Seen in Jan 2026, not since. `_time_delta` measures that offset and is what made scheduling work then,
+  so do not remove it; it currently latches only from a `0x8101` *get*, which rarely runs. See the 31-day clock bug
+  in `docs/protocol.md`.
 - Use `now_aware()` from `data_types`, never naive `datetime.now()` — `start_charging` rejects
   naive datetimes.
 
