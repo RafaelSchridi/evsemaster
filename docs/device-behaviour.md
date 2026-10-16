@@ -17,8 +17,6 @@ start or stop is accepted and acted on by a charger that is sending no telemetry
 `HEADING_EVENT`, `CURRENT_STATUS_EVENT` and `CURRENT_CHARGING_STATUS_EVENT`, not *where*:
 everything the charger sends is broadcast. It is charger-side state, it can be lost, and losing it changes nothing about whether commands are accepted.
 
-Whether a charger can hold more than one registration at a time is untested.
-
 ## The client registration
 
 ```mermaid
@@ -47,6 +45,9 @@ stateDiagram-v2
 
 The two modes are sharply separated. A charger that has a client announces essentially never; one without a client announces every few seconds and sends nothing else. 
 A single announcement means little, but a **sustained announcement beat means the charger has no client.**
+
+**A second client does not displace the first.** While the vendor app was connected to an EC311S, the integration
+kept its registration, but heading gaps reached 30 s instead of 10.
 
 ## The keepalive contract
 
@@ -109,10 +110,12 @@ Two further properties of this frame, both confirmed by measurement:
 
 When a session ends the charger uploads a record and **keeps rebroadcasting it until an app acknowledges it**. A charger that has never been acknowledged holds a backlog and replays it continuously - one record every few seconds, indefinitely.
 
-This does not affect the registration; a charger with thousands of unacknowledged records reports telemetry normally. 
+This does not affect the registration; an EC311S with over a hundred unacknowledged records reports telemetry normally.
 
-If acknowledging with 0x800A empties only the upload queue, the vendor app can still read every record from history, and acknowledging does no harm. 
-This is untested. To test it, read the 0x800B count, acknowledge one record, and read the count again.
+**Acknowledging takes a record out of the replay, not out of history.** The charger keeps its last 300 sessions in a
+ring that 0x800B/0x800C read, acknowledged or not. The vendor app, though, builds its history only from records it
+acknowledges itself and never reads the charger's. A client that acknowledges records therefore hides those sessions
+from the vendor app.
 
 ## Timings
 
@@ -123,9 +126,10 @@ Measured on a Telestar EC311S over 20.7 hours registered, cross-checked against
 |---|---|---|
 | `HEADING_EVENT` interval | 10.09s, ~100% delivered | 10s (emproto) |
 | `CURRENT_STATUS_EVENT` interval | 15.1s median, 31s worst | 5–10s (emproto) |
+| `CURRENT_CHARGING_STATUS_EVENT` interval | ~13s | - |
 | `LOGIN_EVENT` with no client | every 3.0s | ~5s (emproto) |
 | `LOGIN_EVENT` while registered | 2 in 20.7h | - |
-| Charge record replay | every 3.6s | - |
+| Charge record replay | every 3.6–6s | - |
 | Registration considered lost after | - | 15s without a heading (emproto) |
 | Device considered offline after | - | 11s (emproto)|
 
@@ -143,9 +147,9 @@ Status cadence is firmware-dependent; treat 5–15s as the range and the heading
 - **Reported power is per phase.** On a three-phase charger the power field carries one
   phase only; summing the measured phases is correct on both single and three phase.
 - **Payload sizes vary.** Single-phase chargers send 25-byte status payloads with no L2/L3
-  block against 33 for three-phase. Status also arrives as 0x000D and charging status as
-  0x0006. According to the app these are the replies to the on-demand requests 0x800D and
-  0x8006, not firmware variants.
+  block against 33 for three-phase. An EC311S sends 33 with L2/L3 at 0 when only L1 is live.
+  Status also arrives as 0x000D and charging status as 0x0006: the replies to the on-demand
+  requests 0x800D and 0x8006, not firmware variants. The charger ignores 0x0004 sent as a request.
 - **A charge starts in three steps, not one.** Measured on an EC311S: the current state moves to 14 (charging)
   while the plug is still 2 (unlocked) and the output still 2 (off); the plug then locks to 4; only then does the
   output turn on to 1. Stopping unwinds the same way, and the output stays on for one status packet after the state

@@ -21,9 +21,16 @@ Three companion docs carry detail this file deliberately does not repeat:
 - Install: `poetry install`
 - Lint/format: `poetry run ruff check` / `poetry run ruff format` (line-length 120)
 - Test: `poetry run pytest`, or `poe check` for lint + tests
-- Real hardware: `poetry run python test.py <host>:<password> [...]` — an interactive shell
-  accepting shortcuts (`status`, `start`, `stop`, `discover`, `use <n>`, `all`), `CommandEnum`
-  names, or raw command values
+- Real hardware: `poe evse`, which reads `EVSE=<host>:<password>` from the gitignored `.env`, or
+  `poetry run python test.py <host>:<password> [...]`. An interactive shell accepting shortcuts
+  (`status`, `start`, `stop`, `discover`, `use <n>`, `all`) or `<command> [hex payload]`, where the
+  command is a `CommandEnum` name or value. A 0x81xx settings command without a payload goes out as
+  a get, and the reply's payload is printed. Requests can go missing: resend before concluding a
+  charger ignores one
+- Wire capture: `poe capture --seconds 60 --out cap.jsonl [CMD[:hex] ...]` records every frame the
+  charger broadcasts, without logging in, and can only send gets. It hears only the charger's side
+  of another client's session. `poetry run python tools/decode_history.py cap.jsonl` lists the
+  charge records in a capture's history replies
 
 `tests/` covers the codec and parsers, listener routing, and device sessions driven over
 loopback by `evsemaster.testing.FakeEvse`. Each test takes its own port from the `listen_port`

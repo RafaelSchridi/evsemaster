@@ -12,3 +12,5 @@ poetry.lock
 dist/
 # Local charger credentials for test.py and captures
 .env
+# Captures from tools/capture.py
+*.jsonl

@@ -1,12 +1,13 @@
-"""Interactive test client. Usage: python test.py <host>:<password> [<host>:<password> ...]"""
+"""Interactive test client. Usage: python test.py <host>:<password> [...], or set EVSE=<host>:<password>"""
 
 import asyncio
 import contextlib
 import logging
+import os
 import sys
 from datetime import datetime
 
-from evsemaster import CommandEnum, DiscoveredDevice, EvseDevice, EvseListener, now_aware
+from evsemaster import Action, CommandEnum, DiscoveredDevice, EvseDevice, EvseListener, now_aware
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -20,6 +21,21 @@ def on_event(device: EvseDevice):
         print(f"[{label(device)}] {event_type}: {data}")
 
     return callback
+
+
+def show_replies(device: EvseDevice) -> set[int]:
+    """Print the payload of the next reply to each typed command; the library logs unhandled ones by name only."""
+    awaited: set[int] = set()
+    handle = device._handle_packet
+
+    async def handle_and_show(packet):
+        if packet.command in awaited:
+            awaited.discard(packet.command)
+            print(f"[{label(device)}] {packet.command.name}: {packet.data.hex()}")
+        await handle(packet)
+
+    device._handle_packet = handle_and_show
+    return awaited
 
 
 def on_discovery(discovered: DiscoveredDevice):
@@ -65,12 +81,12 @@ def parse_start_args(args: list[str]) -> tuple[int, datetime, int]:
     return amps, start_date, duration_min
 
 
-async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
+async def command_input_loop(listener: EvseListener, devices: list[EvseDevice], awaited: dict[EvseDevice, set[int]]):
     """Read commands from terminal and send them to the selected EVSE(s).
 
     Accepts either:
-    - CommandEnum names (e.g., CURRENT_STATUS_EVENT, HEADING_EVENT)
-    - Decimal or hex values (e.g., 32772 or 0x8004)
+    - `<command> [hex payload]`, where command is a CommandEnum name (e.g. VERSION_REQUEST) or its decimal or hex
+      value (e.g. 0x8106); a settings command without a payload goes out as a get
     - Shortcuts: status, start [amps] [date] [minutes], stop, discover, use <n>, all, help, quit
     """
     names = [e.name for e in CommandEnum]
@@ -93,6 +109,7 @@ async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
         if cmd_str == "help":
             print("Available CommandEnum names:")
             print(", ".join(sorted(names)))
+            print("Send one with: <name or value> [hex payload]; a 0x81xx settings command sends a get by default")
             print("Shortcuts: status, start [amps] [YYYY-MM-DDTHH:MM:SS] [minutes], stop, discover")
             print(f"Targets: use <1-{len(devices)}>, all")
             for i, device in enumerate(devices, 1):
@@ -113,6 +130,7 @@ async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
 
         # resolve a raw command up front so a command error is not reported per device
         enum_cmd = None
+        payload = b""
         if cmd_str not in ("status", "start", "stop"):
             try:
                 enum_cmd = CommandEnum[cmd_str.upper()]
@@ -122,6 +140,13 @@ async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
                 except ValueError:
                     print("Unknown command. Type 'help' for a list of commands.")
                     continue
+            try:
+                payload = bytes.fromhex("".join(args))
+            except ValueError:
+                print(f"Invalid hex payload: {' '.join(args)}")
+                continue
+            if not payload and enum_cmd & 0xFF00 == 0x8100 and enum_cmd != CommandEnum.VERSION_REQUEST:
+                payload = bytes([Action.GET])
 
         for device in targets:
             try:
@@ -137,15 +162,17 @@ async def command_input_loop(listener: EvseListener, devices: list[EvseDevice]):
                     ok = await device.stop_charging()
                     print(f"[{label(device)}] stop charging {'sent' if ok else 'failed'}")
                 else:
-                    device.send_command(enum_cmd)
-                    print(f"[{label(device)}] sent {enum_cmd.name} (0x{int(enum_cmd):04X})")
+                    awaited[device].add(enum_cmd & 0x7FFF)
+                    device.send_command(enum_cmd, payload)
+                    print(f"[{label(device)}] sent {enum_cmd.name} (0x{int(enum_cmd):04X}) {payload.hex()}")
             except Exception as e:
                 print(f"[{label(device)}] failed: {e}")
 
 
 async def main():
-    if len(sys.argv) < 2:
-        print("Usage: python test.py <host>:<password> [<host>:<password> ...]")
+    targets = sys.argv[1:] or ([os.environ["EVSE"]] if os.environ.get("EVSE") else [])
+    if not targets:
+        print("Usage: python test.py <host>:<password> [...], or set EVSE=<host>:<password> in .env")
         sys.exit(1)
 
     listener = EvseListener(on_discovery=on_discovery)
@@ -153,12 +180,14 @@ async def main():
         sys.exit(1)
 
     devices: list[EvseDevice] = []
+    awaited: dict[EvseDevice, set[int]] = {}
     status_task = None
     try:
-        for arg in sys.argv[1:]:
+        for arg in targets:
             host, _, password = arg.partition(":")
             device = await listener.async_add_device(host, password)
             device.on_event = on_event(device)
+            awaited[device] = show_replies(device)
             devices.append(device)
             print(f"Logging in to {host}...")
             if await device.login():
@@ -167,7 +196,7 @@ async def main():
                 print(f"Login failed for {host}; leaving it registered (it may announce itself later)")
 
         status_task = asyncio.create_task(periodic_status(devices))
-        await command_input_loop(listener, devices)
+        await command_input_loop(listener, devices, awaited)
     except Exception as e:
         print(f"Error: {e}")
     finally:

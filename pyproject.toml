@@ -47,3 +47,13 @@ lint = "ruff check"
 format = "ruff format"
 test = "pytest"
 check = ["lint", "test"]
+
+[tool.poe.tasks.evse]
+cmd = "python test.py"
+envfile = ".env"
+help = "Interactive charger shell, for the charger in EVSE=host:password in .env or the arguments"
+
+[tool.poe.tasks.capture]
+cmd = "python tools/capture.py"
+envfile = ".env"
+help = "Record charger broadcasts to JSONL, optionally sending read-only requests; see tools/capture.py"

@@ -64,26 +64,26 @@ get charging status (`0x8006`), charge fee, service fee, maneuver, language, out
 | `0x0155` | wrong password | wire |
 | `0x0003 → 0x8003` | heading (keepalive) | wire |
 | `0x0004 → 0x8004` | status push | wire |
-| `0x800D → 0x000D` | status on demand, empty request | app |
+| `0x800D → 0x000D` | status on demand, empty request | wire, app |
 | `0x0005 → 0x8005` | charging status push; the acknowledgement is from the app | wire, app |
-| `0x8006 → 0x0006` | charging status on demand, empty request | app |
+| `0x8006 → 0x0006` | charging status on demand, empty request | wire, app |
 | `0x8007 → 0x0007` | start charge | wire |
 | `0x8008 → 0x0008` | stop charge | wire |
 | `0x0009 → 0x8009` | current charge record | emproto, app |
 | `0x000A → 0x800A` | finished charge record, resent until acknowledged | wire, app |
-| `0x800B → 0x000B` | history: record count | app |
-| `0x800C → 0x000C` | history: one record | app |
+| `0x800B → 0x000B` | history: capacity and counters | wire, app |
+| `0x800C → 0x000C` | history: one record | wire, app |
 | `0x8101 → 0x0101` | system time | wire, app |
 | `0x8102 → 0x0102` | change charger password | app |
-| `0x8104`, `0x8105` | charge fee, service fee; no reply | app, not decoded |
+| `0x8104 → 0x0104`, `0x8105 → 0x0105` | charge fee, service fee; the app writes both on every connect | wire, app, partly decoded |
 | `0x8106 → 0x0106` | version | wire, app |
 | `0x8107 → 0x0107` | output amps | wire, app |
 | `0x8108 → 0x0108` | nickname | wire, app |
 | `0x810A → 0x010A` | Wi-Fi config, **holds the passphrase** | wire, app |
-| `0x810D → 0x010D` | start method (charge without the app); no answer from EC311S | emproto, app |
+| `0x810D → 0x010D` | start method (charge without the app) | wire, emproto, app |
 | `0x810E → 0x010E` | weekly plan | wire, app |
-| `0x810F → 0x010F` | display language | emproto, app |
-| `0x8112 → 0x0112` | temperature unit | emproto, app |
+| `0x810F → 0x010F` | display language | wire, emproto, app |
+| `0x8112 → 0x0112` | temperature unit | wire, emproto, app |
 | `0x8122 → 0x0122`, `0x8123 → 0x0123` | RFID set, get | app, not decoded |
 | `0x8150`–`0x8153` → `0x0150`–`0x0153` | firmware upgrade: start, package, result, cancel | app, not decoded |
 | `0x8162 → 0x0162` | "maneuver", a multi-field settings command; no answer from EC311S | app, partly decoded |
@@ -101,9 +101,13 @@ get charging status (`0x8006`), charge fee, service fee, maneuver, language, out
 | 49 | 4 | max power |
 | 53 | 1 | max amps |
 
+An EC311S sends 119 bytes. From byte 54 it carries `TELESTAR-DIGITAL` and `GmbH`, not decoded. Its hardware version
+here, `25.1651.114C0933`, is not the string [Version](#version-0x8106--0x0106) returns.
+
 ### Status (`0x0004`, `0x000D`)
 
-25 bytes on single-phase chargers, 33 on three-phase.
+25 bytes on single-phase chargers, 33 on three-phase. An EC311S sends 33 with L2 and L3 at `0`, not `FFFF`, when
+only L1 is live.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -157,7 +161,8 @@ The app has two paths: bytes 21–22 alone, as a 16-bit string, for firmware wit
 
 ### Charging status (`0x0005`, `0x0006`)
 
-At least 74 bytes; the app guards for 80 and reads a byte at offset 74 whose meaning is unknown.
+At least 74 bytes; the app guards for 80 and reads a byte at offset 74 whose meaning is unknown. An EC311S always
+sends exactly 74.
 
 Every offset below from 18 onward is confirmed against the app, which reads each field as a hex string and parses
 it. Offsets 0–17 are not read on this path.
@@ -214,8 +219,9 @@ Reply. The values below are the app's own message texts, which match emproto exa
 
 ### Stop charge (`0x8008 → 0x0008`)
 
-- **Request:** 17 bytes, `[line id, user id (16)]` (app). An EC311S also accepts a bare `[line id]`, but then
-  records no user id against the stop. A cable pull writes the firmware marker `Pull Plug` into that field instead.
+- **Request:** 17 bytes, `[line id, user id (16)]` (app). An EC311S also accepts a bare `[line id]`, but reads 16
+  bytes of user id regardless: the record gets the leftovers of the previous packet, such as the epoch from a set-time
+  request followed by the tail of a user id from a start request.
 - **Reply:** `[line id, result, fail reason]` (emproto).
 
 ### Charge record (`0x0009`, `0x000A`, and `0x000C` from byte 9)
@@ -223,15 +229,15 @@ Reply. The values below are the app's own message texts, which match emproto exa
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 1 | line id |
-| 1 | 16 | started by, user id |
-| 17 | 16 | stopped by, user id; `Pull Plug` = the cable was unplugged |
+| 1 | 16 | started by: user id, or a firmware marker (see start type) |
+| 17 | 16 | stopped by: user id, or a firmware marker (see stop reason) |
 | 33 | 16 | charge id |
 | 49 | 1 | has reservation |
-| 50 | 1 | start type |
-| 51 | 1 | charge type |
+| 50 | 1 | start type, see below |
+| 51 | 1 | charge type: `1`, or `2` from the app when it sets a max duration |
 | 52 | 6 | charge params 1–3, u16 each |
-| 58 | 1 | stop reason; values not mapped, 17 seen with an unplug |
-| 59 | 1 | has stop charge |
+| 58 | 1 | stop reason, see below |
+| 59 | 1 | has stop charge: `1`, or `2` after a power loss |
 | 60 | 4 | reservation time |
 | 64 | 4 | start time |
 | 68 | 4 | stop time |
@@ -244,29 +250,62 @@ Reply. The values below are the app's own message texts, which match emproto exa
 | 93 | 2 | fee, ×0.01 |
 | 95 | … | power and fee logs (emproto) |
 
+Start types and stop reasons below are mapped from the 238 records on an EC311S, from the wire alone. The charger's
+duration and energy limits apply whatever the charge type: `Fix Time` ends charges of both types.
+
+| Start type | Started by | Meaning |
+|---|---|---|
+| 1 | user id | a client start |
+| 3 | `PAP`, charge id `PAP <epoch>` | probably plug-and-play: a start by plugging in |
+| 4 | `Clock`, charge id `Clock <epoch>` | the charger's own schedule, see [Weekly plan](#weekly-plan-0x810e--0x010e) |
+| 0 | `0x01` | seen once, on a blank record: charge type 0, no limits, no charge id, stop reason 14 |
+
+| Stop reason | Stopped by | Meaning |
+|---|---|---|
+| 0 | user id | a reservation cancelled before it started; stop time before the reservation time, no energy |
+| 11 | user id | stopped by a client |
+| 14 | `Auto Stop` | unknown; seen once, on the blank record above |
+| 15 | `Fix Energy` | max energy reached; seen only with a limit of 0, which ends the charge at once |
+| 16 | `Fix Time` | max duration reached |
+| 17 | `Pull Plug` | cable unplugged |
+| 255 | `Power Down` | power loss |
+
 **Acknowledgement** `0x8009` / `0x800A`, 18 bytes: `[line id, charge id (16), 1]`. The charge id is the one from
 the record. Without it, the charger resends the `0x000A` record every few seconds.
 
 ### History (`0x800B`, `0x800C`)
 
-- **Count:** `0x800B [0x01]` → `0x000B`; bytes 1–4 are the number of records (u32).
-- **One record:** `0x800C [0x01, index u32]` → `0x000C`; bytes 4–7 echo the index, byte 8 is `1` when a record
-  follows, and a [charge record](#charge-record-0x0009-0x000a-and-0x000c-from-byte-9) starts at byte 9.
-- **Order:** the app requests index 1, 2, 3 and so on.
+The charger keeps its sessions in a ring of 300 slots on an EC311S, numbered from 1. Records are written in ascending
+slot order and wrap, so the newest overwrites the oldest.
 
-Reading history does not change anything on the charger. Whether acknowledging a `0x000A` record removes it from
-history is unknown.
+- **Count:** `0x800B [0x01]` → `0x000B`, 13 bytes: `[byte, capacity u32, a u32, b u32]`.
+  - The app reads only bytes 1–4 and treats them as the record count, but they hold the capacity: 300.
+  - `a + b` is always the capacity. Acknowledging a `0x000A` record moves one from `b` to `a`, and a new record adds
+    one to `b`. That fits `b` = records not yet acknowledged and `a` = the rest.
+  - Byte 0 read `00`, `ff` and `01` at different times. Meaning unknown.
+- **One record:** `0x800C [0x01, index u32]` → `0x000C`; bytes 0–3 are the capacity, bytes 4–7 echo the index,
+  byte 8 is a flag, and a [charge record](#charge-record-0x0009-0x000a-and-0x000c-from-byte-9) starts at byte 9.
+  - Flag `1`: a record follows.
+  - Flag `3`: no record. Index 0 and indexes above the capacity return it. Some flag-3 slots inside the ring still hold
+    an old record's bytes, others zeros, and a never-written slot is all `FF`. The app has no delete command, so what
+    empties a slot is unknown.
+- **Pacing:** replies go missing even at a slow pace: 18 of 300 at four requests a second, 2 of 7 at one per 2.5 s.
+  Retry a read that gets no reply.
+
+Reading history changes nothing on the charger, and neither does acknowledging a `0x000A` record: slots 1–10 still
+held their records after the app acknowledged them. The app's history screen reads nothing from the charger; it lists
+the records the app itself acknowledged.
 
 ### Version (`0x8106 → 0x0106`)
 
-Empty request. Reply, 37 bytes:
+Empty request. Reply, 37 bytes; an EC311S returns `25.1651.114C09` for both versions and `8ae2d4bb` as the feature:
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 16 | hardware version |
 | 16 | 16 | software version |
 | 32 | 4 | feature; the app shows it as "firmware signature" |
-| 36 | 1 | "supportNew" flag |
+| 36 | 1 | "supportNew" in the app; `0x0B` on an EC311S, so not a boolean |
 
 ### One-value settings
 
@@ -278,7 +317,8 @@ Payload `[action, value]`. Get: `[2]`; emproto sends `[2, 0]`.
 | `0x810F → 0x010F` language | 1 en, 2 it, 3 de, 4 fr, 5 es, 6 he, 7 pl, 8 tr, 9 zh-Hant |
 | `0x8112 → 0x0112` temperature unit | 1 °C, 2 °F |
 
-Values are confirmed from the app for language and temperature unit.
+Values are confirmed from the app for language and temperature unit. An EC311S answers all three gets: `02 10`
+(16 A), `02 01` (English) and `02 01` (°C).
 
 ### Start method (`0x810D → 0x010D`)
 
@@ -287,8 +327,8 @@ Which methods may start a charge: the app, an RFID card, the button, or just plu
 
 The write values the app uses are `0`, `1` and `2`, matching emproto's enabled / disabled / seen-while-disabled.
 The charger reports a wider range on read (values up to ~0x2e seen in the app's UI code), which encodes the exact
-combination of enabled start methods. That encoding is not mapped. `0x810D` drew no answer from an EC311S, so this
-may be BS20-only.
+combination of enabled start methods. That encoding is not mapped. An EC311S answers the get `[2]` with `02 01`; it
+ignores an empty request.
 
 ### Nickname (`0x8108 → 0x0108`)
 
@@ -325,7 +365,8 @@ Observed on an EC311S in January 2026, not since.
 
 ### Weekly plan (`0x810E → 0x010E`)
 
-- **Size:** always 64 bytes. Get: `[2]` followed by 63 zero bytes. Set: `[1]` followed by 7 slots.
+- **Size:** always 64 bytes. Get: `[2]` followed by 63 zero bytes; an EC311S also answers a bare `[2]`. Set: `[1]`
+  followed by 7 slots.
 - **Slots:** slot *i* starts at byte `1 + 9i`. Slot 0 is most likely Monday, since the app lists Mon–Sun.
 
 | Offset in slot | Size | Field |
@@ -338,6 +379,19 @@ Observed on an EC311S in January 2026, not since.
 
 The app switches the whole plan off by setting every slot's state to `1`. The protocol holds a separate time for each
 day, even though the app's interface sets one time for all selected days.
+
+An EC311S with the plan off returns `01 00 00 0000 00000000` for every slot: the limit reads `0` where the app writes
+`FFFFFFFF`.
+
+A start by the charger's own schedule shows in the charge record as start type 4, `Clock`, without a reservation. A
+slot is a window: plugging in during it starts a charge with the rest of the window as its max duration (plugged in
+at 12:28, 212 minutes, ended by `Fix Time` at 16:00).
+
+### Fees (`0x8104 → 0x0104`, `0x8105 → 0x0105`)
+
+The app writes both after every login: charge fee `[1, 1, 0, 0]` (set, fee type 1, fee 0) and service fee with an
+**empty** payload. An EC311S answers both with `01 01 0000`. The service-fee reply is the previous packet's bytes: the
+same over-read as the bare [stop charge](#stop-charge-0x8008--0x0008). Not decoded further.
 
 ### Change password (`0x8102 → 0x0102`)
 
@@ -357,7 +411,7 @@ unknown; the 105-byte one is what an EC311S returns.
 
 ## Not decoded
 
-RFID (`0x8122`, `0x8123`), firmware upgrade (`0x8150`–`0x8153`) and fees (`0x8104`, `0x8105`).
+RFID (`0x8122`, `0x8123`) and firmware upgrade (`0x8150`–`0x8153`). Fees are only partly decoded.
 
 `0x8162` "maneuver" is an 8-byte multi-field command: the app sends `[0, a, b, 0, 0, c, 0, 0]` and reads three
 fields back. It is reused for enabling/disabling the password prompt and for the LCD brightness, so the three
