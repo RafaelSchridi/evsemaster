@@ -1,6 +1,4 @@
-# CLAUDE.md
-
-Guidance for Claude Code working in this repository.
+# AGENTS.md
 
 ## Overview
 
@@ -8,7 +6,7 @@ Guidance for Claude Code working in this repository.
 EVSEMaster app, speaking its reverse-engineered UDP protocol (after the TypeScript project
 [johnwoo-nl/emproto](https://github.com/johnwoo-nl/emproto)). The Home Assistant integration
 that consumes it lives in the sibling repo `RafaelSchridi/evsemaster-homeassistant` — see its
-CLAUDE.md for the cross-repo workflow.
+AGENTS.md for the cross-repo workflow.
 
 Three companion docs carry detail this file deliberately does not repeat:
 
@@ -16,7 +14,7 @@ Three companion docs carry detail this file deliberately does not repeat:
   before touching session or protocol code.**
 - `docs/protocol.md` — frame, command table and payload layouts, each marked with its source
   (wire capture, vendor app, or emproto).
-- `TODO.md` — ranked open work, including known bugs and an unfixed credential leak.
+- `TODO.md` — ranked open work, including known bugs.
 
 ## Commands
 
