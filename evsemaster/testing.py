@@ -12,10 +12,11 @@ logins, keeps a session alive with headings, and records what it received.
 
 import asyncio
 import struct
+import time
 
-from .data_types import CommandEnum
+from .data_types import Action, CommandEnum
 from .listener import LISTEN_PORT
-from .protocol import build_packet
+from .protocol import build_packet, shanghai_offset
 
 
 def device_info_payload(brand: str = "BESEN", model: str = "BS20", max_amps: int = 32) -> bytes:
@@ -29,7 +30,9 @@ def device_info_payload(brand: str = "BESEN", model: str = "BS20", max_amps: int
     return bytes(payload)
 
 
-def status_payload(three_phase: bool = True, state: int = 13, plug: int = 4, power: int = 0) -> bytes:
+def status_payload(
+    three_phase: bool = True, state: int = 13, plug: int = 4, power: int = 0, emergency_stop: bool = False
+) -> bytes:
     """Payload of a status event; single-phase chargers omit the L2/L3 block."""
     payload = bytearray(33 if three_phase else 25)
     struct.pack_into(">B", payload, 0, 1)
@@ -39,6 +42,7 @@ def status_payload(three_phase: bool = True, state: int = 13, plug: int = 4, pow
     struct.pack_into(">I", payload, 9, 123456)
     struct.pack_into(">H", payload, 13, 22500)
     struct.pack_into(">H", payload, 15, 22000)
+    struct.pack_into(">B", payload, 17, 0 if emergency_stop else 1)
     struct.pack_into(">B", payload, 18, plug)
     struct.pack_into(">B", payload, 19, 1)
     struct.pack_into(">B", payload, 20, state)
@@ -83,6 +87,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         plug: int = 4,
         announce_interval: float = 0.5,
         heading_interval: float = 1.0,
+        clock_skew: int = 0,
     ):
         self.serial = serial
         self.password = password
@@ -98,7 +103,9 @@ class FakeEvse(asyncio.DatagramProtocol):
         self.plug = plug
         self.announce_interval = announce_interval
         self.heading_interval = heading_interval
+        self.clock_skew = clock_skew
         self.received: list[CommandEnum] = []
+        self.payloads: dict[CommandEnum, bytes] = {}
         self.amps_set: list[int] = []
         self.transport: asyncio.DatagramTransport | None = None
         self.client: tuple[str, int] | None = None
@@ -168,6 +175,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         cmd = CommandEnum(struct.unpack(">H", data[19:21])[0])
         self.received.append(cmd)
         payload = data[21:-4]
+        self.payloads[cmd] = payload
 
         if cmd == CommandEnum.LOGIN_REQUEST:
             if data[13:19].decode(errors="ignore") != self.password:
@@ -180,20 +188,21 @@ class FakeEvse(asyncio.DatagramProtocol):
         elif cmd == CommandEnum.LOGIN_CONFIRM_RESPONSE:
             if not self._heading_task:
                 self._heading_task = asyncio.create_task(self._headings())
-        elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
-            self.send(
-                CommandEnum.CURRENT_STATUS_EVENT, status_payload(self.three_phase, state=self.state, plug=self.plug)
-            )
-            self.send(CommandEnum.CURRENT_CHARGING_STATUS_EVENT, charging_payload())
+        elif cmd == CommandEnum.STATUS_REQUEST:
+            self.send(CommandEnum.STATUS_EVENT, status_payload(self.three_phase, state=self.state, plug=self.plug))
+        elif cmd == CommandEnum.CHARGING_STATUS_REQUEST:
+            self.send(CommandEnum.CHARGING_STATUS_EVENT, charging_payload())
         elif cmd == CommandEnum.SYSTEM_TIME_REQUEST:
-            self.send(CommandEnum.SYSTEM_TIME_EVENT, payload[:5])
+            # reports its own clock even right after a set, as a skewed charger did in January 2026
+            clock = int(time.time()) - shanghai_offset() + self.clock_skew
+            self.send(CommandEnum.SYSTEM_TIME_EVENT, struct.pack(">BI", payload[0] if payload else Action.GET, clock))
         elif cmd == CommandEnum.NICKNAME_REQUEST:
-            self.send(CommandEnum.NICKNAME_EVENT, bytes([CommandEnum.GET_ACTION]) + self.nickname.encode() + b"\x00")
+            self.send(CommandEnum.NICKNAME_EVENT, bytes([Action.GET]) + self.nickname.encode() + b"\x00")
         elif cmd == CommandEnum.OUTPUT_AMPERAGE_REQUEST:
-            if payload and payload[0] == CommandEnum.SET_ACTION and len(payload) > 1 and payload[1]:
+            if payload and payload[0] == Action.SET and len(payload) > 1 and payload[1]:
                 self.amps_set.append(payload[1])
             amps = self.amps_set[-1] if self.amps_set else 16
-            self.send(CommandEnum.OUTPUT_AMPERAGE_EVENT, bytes([CommandEnum.GET_ACTION, amps]))
+            self.send(CommandEnum.OUTPUT_AMPERAGE_EVENT, bytes([Action.GET, amps]))
 
     async def _announcements(self) -> None:
         while True:

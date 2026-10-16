@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import struct
 from datetime import datetime, timedelta
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from .capabilities import Capabilities
 from .capabilities import for_device as capabilities_for
 from .data_types import (
+    Action,
     ChargingStatus,
     CommandEnum,
     CurrentStateEnum,
@@ -23,6 +25,7 @@ from .protocol import (
     ZERO_SERIAL,
     build_packet,
     build_start_charging_payload,
+    build_stop_charging_payload,
     parse_charging_status,
     parse_device_info,
     parse_status,
@@ -41,6 +44,10 @@ LOGIN_RETRY_INTERVAL = 3
 LOGIN_ATTEMPTS = 4
 
 DEFAULT_SEND_PORT = 7248
+
+# Clients rewrite the clock often (the vendor app every 10 s), so a smaller skew is drift or a timezone disagreement
+# that the next write moves again. Only a skew that survives our own write can be aimed at.
+CLOCK_SKEW_THRESHOLD = 86400
 
 
 class EvseDevice:
@@ -238,21 +245,19 @@ class EvseDevice:
                 self._last_heading = None
                 if self._login_future and not self._login_future.done():
                     self._login_future.set_result(False)
-            elif cmd == CommandEnum.CURRENT_STATUS_EVENT:
+            elif cmd in (CommandEnum.CURRENT_STATUS_EVENT, CommandEnum.STATUS_EVENT):
                 self._update_status(packet)
-                self.send_command(CommandEnum.CURRENT_STATUS_RESPONSE)
-            elif cmd == CommandEnum.REQUEST_STATUS_RECORD:
-                # Some devices report status under this command; only trust an exact status payload.
-                if packet.length() in (25, 33):
-                    self._update_status(packet)
-                else:
-                    log.debug("Ignoring %s with %d byte payload", cmd.name, packet.length())
-            elif cmd in (CommandEnum.CURRENT_CHARGING_STATUS_EVENT, CommandEnum.CURRENT_CHARGING_STATUS_EVENT_2):
+                if cmd == CommandEnum.CURRENT_STATUS_EVENT:
+                    self.send_command(CommandEnum.CURRENT_STATUS_RESPONSE)
+            elif cmd in (CommandEnum.CURRENT_CHARGING_STATUS_EVENT, CommandEnum.CHARGING_STATUS_EVENT):
                 charging_status = parse_charging_status(packet, self._shanghai_epoch_to_datetime)
                 if charging_status:
                     self._charging_status = charging_status
                     log.debug(f"Charging Status: \r\n {charging_status}")
                     self.send_event(ChargingStatus.__name__, charging_status)
+                if cmd == CommandEnum.CURRENT_CHARGING_STATUS_EVENT:
+                    # the app's payload; firmware over-reads short payloads, so not an empty one
+                    self.send_command(CommandEnum.CURRENT_CHARGING_STATUS_RESPONSE, bytes([0]))
             elif cmd == CommandEnum.NICKNAME_EVENT:
                 nickname = packet.get_string(1, packet.length() - 1)
                 log.debug(f"Nickname: {nickname}")
@@ -291,32 +296,31 @@ class EvseDevice:
         self.send_event(EvseStatus.__name__, status)
 
     def _handle_system_time(self, packet: DataPacket) -> None:
-        """Track device clock skew from a system time reply."""
-        action = packet.get_int(0, 1)
+        """Track device clock skew from a system time reply, set or get alike."""
         if packet.length() < 5:
-            log.debug(f"System time event received (action: {action})")
+            log.debug("System time event without a time (action: %d)", packet.get_int(0, 1))
             return
         device_epoch = packet.get_int(1, 4)
-        log.debug(
-            f"Device time {'set' if action == CommandEnum.SET_ACTION else 'get'}: "
-            f"{self._shanghai_epoch_to_datetime(device_epoch)} (epoch: {device_epoch})"
-        )
-        if action != CommandEnum.GET_ACTION:
+        if not device_epoch:
             return
         delta = device_epoch + shanghai_offset() - int(now_aware().timestamp())
-        # only update if > 1 day out and changed by > 1 minute
-        if delta > 86400 and delta - self._time_delta > 60:
-            delta += 60 - (delta % 60)  # round up to whole minutes
-            self._time_delta = delta
-            log.info(f"Calculated time delta: {self._time_delta} s")
+        log.debug("Device clock is %+d s from ours (epoch %d)", delta, device_epoch)
+        if abs(delta) <= CLOCK_SKEW_THRESHOLD:
+            if self._time_delta:
+                log.info("Device clock agrees with ours again, dropping the %d s correction", self._time_delta)
+            self._time_delta = 0
+            return
+        if abs(delta - self._time_delta) > 60:
+            # rounded up, so a schedule fires late rather than early
+            self._time_delta = math.ceil(delta / 60) * 60
+            log.info("Device clock is %d s off, correcting schedules for it", self._time_delta)
 
     async def request_status(self) -> bool:
-        """Request current EVSE status."""
+        """Request current EVSE status and charging status."""
         if not self.is_authorised:
             raise NotLoggedInError("Please login before requesting status")
-        self.send_command(CommandEnum.CURRENT_STATUS_EVENT)
-        # get device time
-        self.send_command(CommandEnum.SYSTEM_TIME_REQUEST, bytes([CommandEnum.GET_ACTION]))
+        self.send_command(CommandEnum.STATUS_REQUEST)
+        self.send_command(CommandEnum.CHARGING_STATUS_REQUEST)
         return True
 
     async def request_essentials(self) -> bool:
@@ -325,10 +329,9 @@ class EvseDevice:
             raise NotLoggedInError("Please login before getting essentials")
         # Sync device time first to ensure correct timestamps
         await self.set_device_time()
-        self.send_command(CommandEnum.NICKNAME_REQUEST, bytes([CommandEnum.GET_ACTION]))
-        self.send_command(CommandEnum.OUTPUT_AMPERAGE_REQUEST, bytes([CommandEnum.GET_ACTION]))
-        self.send_command(CommandEnum.CURRENT_STATUS_EVENT)
-        return True
+        self.send_command(CommandEnum.NICKNAME_REQUEST, bytes([Action.GET]))
+        self.send_command(CommandEnum.OUTPUT_AMPERAGE_REQUEST, bytes([Action.GET]))
+        return await self.request_status()
 
     async def start_charging(
         self,
@@ -388,7 +391,7 @@ class EvseDevice:
         """Send stop charging request."""
         if not self.is_authorised:
             raise NotLoggedInError("Please login before stopping charge")
-        self.send_command(CommandEnum.CHARGE_STOP_REQUEST, bytes([1]))  # port id
+        self.send_command(CommandEnum.CHARGE_STOP_REQUEST, build_stop_charging_payload(self.user_id))
         return True
 
     async def set_nickname(self, nickname: str) -> bool:
@@ -405,8 +408,7 @@ class EvseDevice:
         full_nickname = "ACP#" + nickname
 
         extra_payload = bytearray(33)
-        # Action: 0 = set, 1 = get
-        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        struct.pack_into(">B", extra_payload, 0, Action.SET)
         # Nickname (up to 20 bytes, ASCII encoded)
         struct.pack_into(f">{len(full_nickname)}s", extra_payload, 1, full_nickname.encode("ascii"))
 
@@ -428,7 +430,7 @@ class EvseDevice:
             )
 
         extra_payload = bytearray(3)
-        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        struct.pack_into(">B", extra_payload, 0, Action.SET)
         struct.pack_into(">B", extra_payload, 1, amperage)
 
         self.send_command(CommandEnum.OUTPUT_AMPERAGE_REQUEST, extra_payload)
@@ -452,7 +454,7 @@ class EvseDevice:
 
         extra_payload = bytearray(5)
         # Action: set (1)
-        struct.pack_into(">B", extra_payload, 0, CommandEnum.SET_ACTION)
+        struct.pack_into(">B", extra_payload, 0, Action.SET)
         # Timestamp as 4-byte unsigned int
         struct.pack_into(">I", extra_payload, 1, shanghai_epoch)
 

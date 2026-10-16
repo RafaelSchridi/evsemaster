@@ -10,3 +10,5 @@ poetry.lock
 
 # Distribution / packaging
 dist/
+# Local charger credentials for test.py and captures
+.env

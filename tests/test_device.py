@@ -1,16 +1,19 @@
 """Session behaviour of one device, against a fake EVSE on loopback."""
 
 import asyncio
+import struct
 from datetime import timedelta
 
 import pytest
 
-from evsemaster import CommandEnum, EvseListener, NotLoggedInError, now_aware
+from evsemaster import Action, CommandEnum, EvseListener, NotLoggedInError, now_aware
 from evsemaster.data_types import CurrentStateEnum, UnsupportedOperationError
 from evsemaster.device import HEADING_TIMEOUT
-from evsemaster.testing import FakeEvse
+from evsemaster.protocol import shanghai_offset
+from evsemaster.testing import FakeEvse, charging_payload
 
 SERIAL = "aa" * 8
+MONTH = 31 * 86400
 
 
 async def until(predicate, seconds=5.0):
@@ -164,6 +167,24 @@ async def test_status_and_charging_status_reach_the_consumer(device, evse):
     assert device.get_latest_device_info().nickname == "Garage"
 
 
+async def test_status_is_requested_with_the_commands_a_charger_answers(device, evse):
+    """The EC311S ignored 0x0004, the charger's own push, so the watchdog never refreshed status."""
+    assert await device.login()
+    evse.received.clear()
+
+    await device.request_status()
+    assert await until(lambda: {CommandEnum.STATUS_REQUEST, CommandEnum.CHARGING_STATUS_REQUEST} <= set(evse.received))
+    assert CommandEnum.CURRENT_STATUS_EVENT not in evse.received
+    assert CommandEnum.CURRENT_STATUS_RESPONSE not in evse.received, "a reply is not a push, nothing to acknowledge"
+
+
+async def test_a_pushed_charging_status_is_acknowledged(device, evse):
+    assert await device.login()
+    evse.send(CommandEnum.CURRENT_CHARGING_STATUS_EVENT, charging_payload())
+    assert await until(lambda: CommandEnum.CURRENT_CHARGING_STATUS_RESPONSE in evse.received)
+    assert evse.payloads[CommandEnum.CURRENT_CHARGING_STATUS_RESPONSE] == b"\x00"
+
+
 @pytest.mark.parametrize("command", ["request_status", "start_charging", "stop_charging", "set_nickname"])
 async def test_commands_are_refused_until_a_login_succeeds(listener, evse, command):
     # no password, so it never logs itself in when the charger announces
@@ -195,11 +216,58 @@ async def test_start_charging_validates_against_the_device_limits(device, evse):
     assert await until(lambda: CommandEnum.CHARGE_START_REQUEST in evse.received)
 
 
+async def test_a_stop_names_us_as_the_stopper(device, evse):
+    assert await device.login()
+    assert await device.stop_charging()
+    assert await until(lambda: CommandEnum.CHARGE_STOP_REQUEST in evse.payloads)
+    assert evse.payloads[CommandEnum.CHARGE_STOP_REQUEST] == b"\x01evsemasterpy" + bytes(4)
+
+
 async def test_setting_the_amperage_is_reflected_back(device, evse):
     assert await device.login()
     assert await device.set_output_amperage(10)
     assert await until(lambda: device.get_latest_device_info().configured_max_amps == 10)
     assert evse.amps_set == [10]
+
+
+@pytest.mark.parametrize("skew", [MONTH, -MONTH], ids=["ahead", "behind"])
+async def test_a_skewed_clock_is_measured_at_login(device, evse, skew):
+    """The set reply at login is the only 0x0101 a pushing charger reliably sends; a get may never run."""
+    evse.clock_skew = skew
+    assert await device.login()
+    assert await until(lambda: device.time_delta == skew)
+    assert evse.payloads[CommandEnum.SYSTEM_TIME_REQUEST][0] == Action.SET, "measured from a get, not the set"
+
+
+async def test_a_skew_under_a_day_is_left_alone(device, evse):
+    """Drift, or another client writing the clock in its own timezone; our next write moves it again."""
+    evse.clock_skew = 2 * 3600
+    assert await device.login()
+    assert await until(lambda: device.get_latest_device_info().nickname == "Garage")  # answered after the clock
+    assert device.time_delta == 0
+
+
+async def test_a_corrected_clock_drops_the_skew(device, evse):
+    evse.clock_skew = MONTH
+    assert await device.login()
+    assert await until(lambda: device.time_delta == MONTH)
+
+    evse.clock_skew = 0
+    assert await device.set_device_time()
+    assert await until(lambda: device.time_delta == 0), "a skew latched once was kept forever"
+
+
+async def test_a_schedule_is_aimed_at_the_chargers_own_clock(device, evse):
+    """In January 2026 a charger running a month ahead started a schedule only once the skew was added."""
+    evse.clock_skew = MONTH
+    assert await device.login()
+    assert await until(lambda: device.time_delta == MONTH)
+
+    start = now_aware() + timedelta(hours=2)
+    assert await device.start_charging(start_date=start)
+    assert await until(lambda: CommandEnum.CHARGE_START_REQUEST in evse.payloads)
+    start_epoch = struct.unpack_from(">I", evse.payloads[CommandEnum.CHARGE_START_REQUEST], 34)[0]
+    assert start_epoch == int(start.timestamp()) - shanghai_offset() + MONTH
 
 
 async def test_a_single_phase_charger_reports_status(listener):

@@ -10,6 +10,8 @@ log = logging.getLogger(__name__)
 _unmapped: set[tuple[type, int]] = set()
 # 21 byte header plus the 4 byte checksum and tail: the smallest a packet can be, payload or not
 ENVELOPE_SIZE = 25
+HEADER = 0x0601
+TAIL = 0x0F02
 
 _mismatched: set[CommandEnum] = set()
 
@@ -23,6 +25,13 @@ class BaseSchema(BaseModel):
     """Base schema for all data types."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class Action(IntEnum):
+    """First payload byte of a set/get command; the reply echoes it."""
+
+    SET = 1
+    GET = 2
 
 
 class CommandEnum(IntEnum):
@@ -40,24 +49,21 @@ class CommandEnum(IntEnum):
     HEADING_EVENT = 0x0003
     HEADING_RESPONSE = 0x8003
 
-    # Packet delimiters
-    HEADER = 0x0601
-    TAIL = 0x0F02
-
     # Status commands
     CURRENT_STATUS_EVENT = 0x0004
     CURRENT_STATUS_RESPONSE = 0x8004
-    REQUEST_STATUS_RECORD = 0x000D  # some devices send status under this command, same layout as 0x0004
+    STATUS_REQUEST = 0x800D
+    STATUS_EVENT = 0x000D  # reply to STATUS_REQUEST, same layout as 0x0004
     CURRENT_CHARGING_STATUS_EVENT = 0x0005  #  Always incoming, sent automatically by EVSE
     CURRENT_CHARGING_STATUS_RESPONSE = 0x8005
     CHARGING_STATUS_REQUEST = 0x8006
-    CURRENT_CHARGING_STATUS_EVENT_2 = 0x0006  # also incoming, same layout as 0x0005
+    CHARGING_STATUS_EVENT = 0x0006  # reply to CHARGING_STATUS_REQUEST, same layout as 0x0005
 
     # Charge control commands
     CHARGE_START_REQUEST = 0x8007
-    CHARGE_START_RESPONSE = 0x0007
+    CHARGE_START_EVENT = 0x0007
     CHARGE_STOP_REQUEST = 0x8008
-    CHARGE_STOP_RESPONSE = 0x0008
+    CHARGE_STOP_EVENT = 0x0008
 
     # Setters/Getters
     NICKNAME_REQUEST = 0x8108
@@ -71,6 +77,7 @@ class CommandEnum(IntEnum):
     START_METHOD_REQUEST = 0x810D
     START_METHOD_EVENT = 0x010D
     WEEKLY_PLAN_REQUEST = 0x810E
+    WEEKLY_PLAN_EVENT = 0x010E
     LANGUAGE_REQUEST = 0x810F
     LANGUAGE_EVENT = 0x010F
     RFID_GET_REQUEST = 0x8123
@@ -79,6 +86,8 @@ class CommandEnum(IntEnum):
     # Requests that rewrite the password, Wi-Fi, RFID cards, fees, firmware or undecoded settings stay out of this
     # enum on purpose, so nothing sends them by name. Their replies are listed so they never reach the packet dump.
     CHANGE_PASSWORD_EVENT = 0x0102
+    CHARGE_FEE_EVENT = 0x0104
+    SERVICE_FEE_EVENT = 0x0105
     WIFI_CONFIG_EVENT = 0x010A  # carries the Wi-Fi passphrase in plaintext
     RFID_SET_EVENT = 0x0122
     FIRMWARE_UPGRADE_START_EVENT = 0x0150
@@ -87,16 +96,11 @@ class CommandEnum(IntEnum):
     FIRMWARE_UPGRADE_CANCEL_EVENT = 0x0153
     MANEUVER_EVENT = 0x0162
 
-    # Desired action for set/get commands
-    SET_ACTION = 1
-    GET_ACTION = 2
-
     # System time commands
     SYSTEM_TIME_REQUEST = 0x8101  # 33025
     SYSTEM_TIME_EVENT = 0x0101  # 257
 
     #### Haven't touched yet ####s
-    CURRENT_CHARGE_RECORD_REQUEST = 0x800D
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
     CURRENT_CHARGE_RECORD_RESPONSE = 0x8009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
@@ -105,7 +109,6 @@ class CommandEnum(IntEnum):
     HISTORY_COUNT_EVENT = 0x000B
     HISTORY_RECORD_REQUEST = 0x800C
     HISTORY_RECORD_EVENT = 0x000C
-    POSSIBLE_REPEATED = 270
 
 
 class FirmwareEnum(IntEnum):
@@ -235,8 +238,8 @@ class DataPacket:
             raise ValueError(f"Data must be at least {ENVELOPE_SIZE} bytes long")
         # Check header
         header = unpack(">H", data[0:2])[0]
-        if header != CommandEnum.HEADER:
-            raise ValueError(f"Invalid header: {header:#06x}, expected {CommandEnum.HEADER:#06x}")
+        if header != HEADER:
+            raise ValueError(f"Invalid header: {header:#06x}, expected {HEADER:#06x}")
         raw_command = unpack(">H", data[19:21])[0]
         try:
             self.command: CommandEnum = CommandEnum(raw_command)
@@ -255,7 +258,7 @@ class DataPacket:
         self.data = data[21 : end - 4]
         checksum, tail = unpack(">HH", data[end - 4 : end])
         # log only for now, no rejection
-        if tail != CommandEnum.TAIL or checksum != sum(data[: end - 4]) % 0xFFFF:
+        if tail != TAIL or checksum != sum(data[: end - 4]) % 0xFFFF:
             _log_mismatch(self.command, checksum, tail, declared, len(data))
         log.debug(self.__repr__())
 
@@ -284,6 +287,13 @@ class DataPacket:
         """Read integer from byte data."""
         end = offset + length
         return int.from_bytes(self.data[offset:end], byteorder="big", signed=False)
+
+    def read_measurement(self, offset: int, length: int, divisor: int = 1) -> float:
+        """Read a scaled measurement; an all-FF field means no reading and reads as 0, as the vendor app does."""
+        raw = self.get_int(offset, length)
+        if raw == (1 << 8 * length) - 1:
+            return 0.0
+        return raw / divisor
 
     def read_temperature(self, offset: int) -> float:
         """Read temperature from byte data."""

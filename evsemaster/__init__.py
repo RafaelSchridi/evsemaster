@@ -2,6 +2,7 @@
 
 from .capabilities import Capabilities
 from .data_types import (
+    Action,
     ChargingStatus,
     CommandEnum,
     CurrentStateEnum,
@@ -18,6 +19,7 @@ from .device import EvseDevice
 from .listener import DeviceAlreadyRegistered, EvseListener
 
 __all__ = [
+    "Action",
     "Capabilities",
     "DeviceAlreadyRegistered",
     "ChargingStatus",

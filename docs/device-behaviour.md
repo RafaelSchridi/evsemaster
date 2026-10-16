@@ -87,7 +87,7 @@ by the retry, an inbound broadcast has usually revealed the real one.
 | `HEADING_EVENT` 0x0003 | `HEADING_RESPONSE` 0x8003 | registration dropped |
 | `CURRENT_STATUS_EVENT` 0x0004 | `CURRENT_STATUS_RESPONSE` 0x8004 | - |
 | `LOGIN_SUCCESS_EVENT` 0x0002 | `LOGIN_CONFIRM_RESPONSE` 0x8001 | handshake never completes |
-| `CURRENT_CHARGING_STATUS_EVENT` 0x0005 | 0x8005 (the app does; we do not) | unknown |
+| `CURRENT_CHARGING_STATUS_EVENT` 0x0005 | `CURRENT_CHARGING_STATUS_RESPONSE` 0x8005, payload `[0x00]` | unknown |
 | `CURRENT_CHARGE_RECORD_EVENT` 0x0009 | 0x8009, charge id acknowledgement | unknown |
 | `UPLOAD_LOCAL_CHARGE_RECORD` 0x000A | 0x800A, charge id acknowledgement | record is rebroadcast forever |
 

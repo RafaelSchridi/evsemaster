@@ -73,8 +73,9 @@ fixture; never bind 28376 in a test.
   `set_device_time` runs on every login for that reason.
 - **A charger can run a month ahead and act on it**, and writing the clock does not clear it — the set reply comes
   back skewed. Seen in Jan 2026, not since. `_time_delta` measures that offset and is what made scheduling work then,
-  so do not remove it; it currently latches only from a `0x8101` *get*, which rarely runs. See the 31-day clock bug
-  in `docs/protocol.md`.
+  so do not remove it. It is measured from every `0x0101`, set reply or get, and applies only above
+  `CLOCK_SKEW_THRESHOLD` (1 day): every client rewrites the clock, so a smaller skew moves again before a schedule
+  fires. See the 31-day clock bug in `docs/protocol.md`.
 - Use `now_aware()` from `data_types`, never naive `datetime.now()` — `start_charging` rejects
   naive datetimes.
 

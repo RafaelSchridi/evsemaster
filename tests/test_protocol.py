@@ -7,10 +7,11 @@ from datetime import timedelta
 import pytest
 
 from evsemaster import CommandEnum, DataPacket
-from evsemaster.data_types import _mismatched, now_aware
+from evsemaster.data_types import HEADER, TAIL, _mismatched, now_aware
 from evsemaster.protocol import (
     build_packet,
     build_start_charging_payload,
+    build_stop_charging_payload,
     parse_charging_status,
     parse_device_info,
     parse_status,
@@ -28,12 +29,12 @@ def packet(cmd: CommandEnum, payload: bytes = b"", serial: str = SERIAL, passwor
 def test_build_packet_round_trip():
     raw = build_packet(CommandEnum.LOGIN_REQUEST, SERIAL, "123456")
     assert len(raw) == 25
-    assert struct.unpack(">H", raw[0:2])[0] == CommandEnum.HEADER
+    assert struct.unpack(">H", raw[0:2])[0] == HEADER
     assert struct.unpack(">H", raw[2:4])[0] == len(raw)
     assert raw[5:13].hex() == SERIAL
     assert raw[13:19] == b"123456"
     assert struct.unpack(">H", raw[-4:-2])[0] == sum(raw[:-4]) % 0xFFFF
-    assert struct.unpack(">H", raw[-2:])[0] == CommandEnum.TAIL
+    assert struct.unpack(">H", raw[-2:])[0] == TAIL
 
 
 def test_build_packet_without_serial_or_password_stays_zeroed():
@@ -75,6 +76,19 @@ def test_unknown_command_dumps_the_packet_without_the_password():
     assert "abcd" in str(err.value), "payload bytes missing from the dump"
     assert SERIAL in str(err.value), "serial missing from the dump"
     assert "313233343536" not in str(err.value), "password leaked into the dump"
+
+
+def test_command_enum_holds_only_commands():
+    """SET_ACTION = 1 and GET_ACTION = 2 were silent aliases of the two login commands."""
+    assert CommandEnum(1) is CommandEnum.LOGIN_EVENT
+    assert CommandEnum(2) is CommandEnum.LOGIN_SUCCESS_EVENT
+    assert not {"SET_ACTION", "GET_ACTION", "HEADER", "TAIL"} & set(CommandEnum.__members__)
+
+
+def test_fee_replies_are_known_commands():
+    """The vendor app writes both fees on every connect, so the replies arrive whether we ask or not."""
+    assert packet(CommandEnum(0x0104), bytes.fromhex("01010000")).command is CommandEnum.CHARGE_FEE_EVENT
+    assert packet(CommandEnum(0x0105), bytes.fromhex("01010000")).command is CommandEnum.SERVICE_FEE_EVENT
 
 
 def test_a_bad_checksum_is_logged_but_the_packet_is_kept(caplog):
@@ -129,6 +143,23 @@ def test_unmapped_state_values_keep_the_rest_of_the_status():
     assert (status.l1_voltage, status.l1_amps) == (230.1, 16.0)
 
 
+def test_emergency_stop_reads_raw_1_as_not_pressed():
+    """4937 of 4937 status packets over 20.7 h read raw 1 while charging normally."""
+    assert not parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, status_payload())).emergency_stop
+    assert parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, status_payload(emergency_stop=True))).emergency_stop
+
+
+def test_measurements_without_a_reading_parse_as_zero():
+    """A single-phase charger may report FFFF for L2/L3; that read as 6553.5 V and 655.35 A."""
+    payload = bytearray(status_payload())
+    struct.pack_into(">I", payload, 5, 0xFFFFFFFF)
+    payload[25:33] = b"\xff" * 8
+    status = parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, bytes(payload)))
+    assert status.current_power == 0
+    assert (status.l2_voltage, status.l2_amps, status.l3_voltage, status.l3_amps) == (0.0, 0.0, 0.0, 0.0)
+    assert (status.l1_voltage, status.l1_amps) == (230.1, 16.0)
+
+
 def test_status_too_short_to_parse_is_dropped():
     assert parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, bytes(24))) is None
 
@@ -145,9 +176,7 @@ def test_device_info_too_short_to_parse_is_dropped():
     assert parse_device_info(packet(CommandEnum.LOGIN_EVENT, bytes(53))) is None
 
 
-@pytest.mark.parametrize(
-    "cmd", [CommandEnum.CURRENT_CHARGING_STATUS_EVENT, CommandEnum.CURRENT_CHARGING_STATUS_EVENT_2]
-)
+@pytest.mark.parametrize("cmd", [CommandEnum.CURRENT_CHARGING_STATUS_EVENT, CommandEnum.CHARGING_STATUS_EVENT])
 def test_charging_status_on_both_commands(cmd):
     status = parse_charging_status(packet(cmd, charging_payload()), lambda epoch: None)
     assert status.charge_id == "2026090412"
@@ -155,6 +184,14 @@ def test_charging_status_on_both_commands(cmd):
     assert status.charge_kwh == 12.34
     assert status.max_electricity == 16
     assert status.max_duration_minutes is None  # 65535 means unlimited
+
+
+def test_charging_status_limits_scale_without_float_noise():
+    """57 * 0.01 is 0.5700000000000001."""
+    payload = bytearray(charging_payload())
+    struct.pack_into(">HH", payload, 22, 57, 57)
+    status = parse_charging_status(packet(CommandEnum.CHARGING_STATUS_EVENT, bytes(payload)), lambda epoch: None)
+    assert (status.max_energy_kwh, status.charge_param3) == (0.57, 0.57)
 
 
 def test_charging_status_too_short_to_parse_is_dropped():
@@ -182,3 +219,8 @@ def test_start_charging_payload_flags_a_future_start_as_a_reservation(offset, ex
         user_id="u", start_date=now_aware() + offset, start_epoch=0, duration_minutes=65535, max_amps=6
     )
     assert struct.unpack_from(">B", payload, 33)[0] == expected
+
+
+def test_stop_charging_payload_names_the_stopper():
+    """The firmware reads 16 bytes of user id whatever we send: a 1-byte stop recorded `<epoch>masterpy`."""
+    assert build_stop_charging_payload("evsemasterpy") == b"\x01evsemasterpy" + bytes(4)

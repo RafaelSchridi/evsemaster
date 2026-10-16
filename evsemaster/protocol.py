@@ -7,6 +7,8 @@ from datetime import datetime
 
 from .data_types import (
     ENVELOPE_SIZE,
+    HEADER,
+    TAIL,
     ChargingStatus,
     CommandEnum,
     DataPacket,
@@ -34,7 +36,7 @@ def build_packet(cmd: CommandEnum, serial: str | None, password: str | None, pay
     packet = bytearray(ENVELOPE_SIZE + len(payload))
 
     # Header
-    struct.pack_into(">H", packet, 0, CommandEnum.HEADER)
+    struct.pack_into(">H", packet, 0, HEADER)
     # Length
     struct.pack_into(">H", packet, 2, len(packet))
     # Key type
@@ -58,7 +60,7 @@ def build_packet(cmd: CommandEnum, serial: str | None, password: str | None, pay
     # Checksum
     struct.pack_into(">H", packet, len(packet) - 4, sum(packet[:-4]) % 0xFFFF)
     # Tail
-    struct.pack_into(">H", packet, len(packet) - 2, CommandEnum.TAIL)
+    struct.pack_into(">H", packet, len(packet) - 2, TAIL)
     return bytes(packet)
 
 
@@ -101,6 +103,11 @@ def build_start_charging_payload(
     return bytes(payload)
 
 
+def build_stop_charging_payload(user_id: str, line_id: int = 1) -> bytes:
+    """Build the CHARGE_STOP_REQUEST payload; the charge record names user_id as who stopped the charge."""
+    return struct.pack(">B16s", line_id, user_id.encode("ascii")[:16])
+
+
 def parse_device_info(packet: DataPacket) -> EvseDeviceInfo | None:
     """Parse device info from a LOGIN_EVENT or LOGIN_SUCCESS_EVENT; both share this layout."""
     if packet.length() < 54:
@@ -123,21 +130,21 @@ def parse_status(packet: DataPacket) -> EvseStatus | None:
     three_phase = packet.length() >= 33
     return EvseStatus(
         line_id=packet.get_int(0, 1),
-        l1_voltage=packet.get_int(1, 2) / 10,
-        l1_amps=packet.get_int(3, 2) / 100,
-        current_power=packet.get_int(5, 4),
+        l1_voltage=packet.read_measurement(1, 2, 10),
+        l1_amps=packet.read_measurement(3, 2, 100),
+        current_power=int(packet.read_measurement(5, 4)),
         total_kwh=packet.get_int(9, 4) / 100,
         inner_temperature=packet.read_temperature(13),
         outer_temperature=packet.read_temperature(15),
-        emergency_stop=packet.get_int(17, 1),
+        emergency_stop=packet.get_int(17, 1) != 1,
         plug_state=packet.get_int(18, 1),
         output_state=packet.get_int(19, 1),
         current_state=packet.get_int(20, 1),
         errors=packet.get_int(21, 4),
-        l2_voltage=packet.get_int(25, 2) / 10 if three_phase else 0.0,
-        l2_amps=packet.get_int(27, 2) / 100 if three_phase else 0.0,
-        l3_voltage=packet.get_int(29, 2) / 10 if three_phase else 0.0,
-        l3_amps=packet.get_int(31, 2) / 100 if three_phase else 0.0,
+        l2_voltage=packet.read_measurement(25, 2, 10) if three_phase else 0.0,
+        l2_amps=packet.read_measurement(27, 2, 100) if three_phase else 0.0,
+        l3_voltage=packet.read_measurement(29, 2, 10) if three_phase else 0.0,
+        l3_amps=packet.read_measurement(31, 2, 100) if three_phase else 0.0,
     )
 
 
@@ -160,8 +167,8 @@ def parse_charging_status(packet: DataPacket, epoch_to_datetime) -> ChargingStat
         start_type=packet.get_int(18, 1),
         charge_type=packet.get_int(19, 1),
         max_duration_minutes=None if raw_max_duration_minutes in (0, 65535) else raw_max_duration_minutes,
-        max_energy_kwh=None if packet.get_int(22, 2) == 65535 else packet.get_int(22, 2) * 0.01,
-        charge_param3=None if packet.get_int(24, 2) == 65535 else packet.get_int(24, 2) * 0.01,
+        max_energy_kwh=None if packet.get_int(22, 2) == 65535 else packet.get_int(22, 2) / 100,
+        charge_param3=None if packet.get_int(24, 2) == 65535 else packet.get_int(24, 2) / 100,
         reservation_datetime=epoch_to_datetime(raw_reservation_epoch) if raw_reservation_epoch else None,
         user_id=packet.get_string(30, 16),
         max_electricity=packet.get_int(46, 1),
