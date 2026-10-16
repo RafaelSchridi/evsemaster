@@ -18,6 +18,7 @@ from evsemaster.protocol import (
 from evsemaster.testing import charging_payload, device_info_payload, status_payload
 
 SERIAL = "1122334455667788"
+UNASSIGNED = 0x7777
 
 
 def packet(cmd: CommandEnum, payload: bytes = b"", serial: str = SERIAL, password: str = "123456") -> DataPacket:
@@ -55,19 +56,21 @@ def test_payload_excludes_the_checksum_and_tail():
     assert packet(CommandEnum.HEADING_EVENT).length() == 0
 
 
+def unknown_command(payload: bytes = b"") -> bytes:
+    raw = bytearray(build_packet(CommandEnum.LOGIN_REQUEST, SERIAL, "123456", payload))
+    struct.pack_into(">H", raw, 19, UNASSIGNED)
+    return bytes(raw)
+
+
 def test_unknown_command_is_rejected_with_its_value():
-    raw = bytearray(build_packet(CommandEnum.LOGIN_REQUEST, SERIAL, "123456"))
-    struct.pack_into(">H", raw, 19, 0x0162)
-    with pytest.raises(ValueError, match="0x0162"):
-        DataPacket(bytes(raw))
+    with pytest.raises(ValueError, match="0x7777"):
+        DataPacket(unknown_command())
 
 
 def test_unknown_command_dumps_the_packet_without_the_password():
     """The dump is what a reporter pastes into an issue, so it must carry the bytes and not the password."""
-    raw = bytearray(build_packet(CommandEnum.LOGIN_REQUEST, SERIAL, "123456", b"\xab\xcd"))
-    struct.pack_into(">H", raw, 19, 0x0162)
     with pytest.raises(ValueError) as err:
-        DataPacket(bytes(raw))
+        DataPacket(unknown_command(b"\xab\xcd"))
 
     assert "abcd" in str(err.value), "payload bytes missing from the dump"
     assert SERIAL in str(err.value), "serial missing from the dump"

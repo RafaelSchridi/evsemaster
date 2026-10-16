@@ -49,6 +49,8 @@ class CommandEnum(IntEnum):
     CURRENT_STATUS_RESPONSE = 0x8004
     REQUEST_STATUS_RECORD = 0x000D  # some devices send status under this command, same layout as 0x0004
     CURRENT_CHARGING_STATUS_EVENT = 0x0005  #  Always incoming, sent automatically by EVSE
+    CURRENT_CHARGING_STATUS_RESPONSE = 0x8005
+    CHARGING_STATUS_REQUEST = 0x8006
     CURRENT_CHARGING_STATUS_EVENT_2 = 0x0006  # also incoming, same layout as 0x0005
 
     # Charge control commands
@@ -64,6 +66,26 @@ class CommandEnum(IntEnum):
     OUTPUT_AMPERAGE_EVENT = 0x0107
     TEMPRATURE_UNIT_REQUEST = 0x8112
     TEMPRATURE_UNIT_EVENT = 0x0112
+    VERSION_REQUEST = 0x8106
+    VERSION_EVENT = 0x0106
+    START_METHOD_REQUEST = 0x810D
+    START_METHOD_EVENT = 0x010D
+    WEEKLY_PLAN_REQUEST = 0x810E
+    LANGUAGE_REQUEST = 0x810F
+    LANGUAGE_EVENT = 0x010F
+    RFID_GET_REQUEST = 0x8123
+    RFID_GET_EVENT = 0x0123
+
+    # Requests that rewrite the password, Wi-Fi, RFID cards, fees, firmware or undecoded settings stay out of this
+    # enum on purpose, so nothing sends them by name. Their replies are listed so they never reach the packet dump.
+    CHANGE_PASSWORD_EVENT = 0x0102
+    WIFI_CONFIG_EVENT = 0x010A  # carries the Wi-Fi passphrase in plaintext
+    RFID_SET_EVENT = 0x0122
+    FIRMWARE_UPGRADE_START_EVENT = 0x0150
+    FIRMWARE_UPGRADE_PACKAGE_EVENT = 0x0151
+    FIRMWARE_UPGRADE_RESULT_EVENT = 0x0152
+    FIRMWARE_UPGRADE_CANCEL_EVENT = 0x0153
+    MANEUVER_EVENT = 0x0162
 
     # Desired action for set/get commands
     SET_ACTION = 1
@@ -76,7 +98,13 @@ class CommandEnum(IntEnum):
     #### Haven't touched yet ####s
     CURRENT_CHARGE_RECORD_REQUEST = 0x800D
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
+    CURRENT_CHARGE_RECORD_RESPONSE = 0x8009
     UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
+    UPLOAD_LOCAL_CHARGE_RECORD_RESPONSE = 0x800A
+    HISTORY_COUNT_REQUEST = 0x800B
+    HISTORY_COUNT_EVENT = 0x000B
+    HISTORY_RECORD_REQUEST = 0x800C
+    HISTORY_RECORD_EVENT = 0x000C
     POSSIBLE_REPEATED = 270
 
 

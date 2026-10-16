@@ -1,6 +1,7 @@
 """Routing: which device does an incoming packet belong to."""
 
 import asyncio
+import logging
 import struct
 
 import pytest
@@ -137,6 +138,22 @@ async def test_a_host_cannot_be_registered_twice(listener):
     with pytest.raises(DeviceAlreadyRegistered) as err:
         await listener.async_add_device("127.0.0.1", "123456")
     assert err.value.device is device
+
+
+@pytest.mark.parametrize("serial", [SERIAL_A, STRANGER], ids=["registered", "discovered"])
+async def test_a_wifi_config_reply_never_logs_its_passphrase(listener, caplog, serial):
+    """The charger broadcasts 0x010A whenever any app reads its Wi-Fi config, passphrase in plaintext at 33."""
+    await listener.async_add_device("127.0.0.1", "123456")
+    payload = bytearray(105)
+    payload[1:5] = b"home"
+    payload[33:47] = b"hunter2hunter2"
+    caplog.set_level(logging.DEBUG, logger="evsemaster")
+
+    feed(listener, CommandEnum.WIFI_CONFIG_EVENT, serial, ("127.0.0.1", 21937), bytes(payload))
+    await asyncio.sleep(0)
+
+    assert "hunter2" not in caplog.text
+    assert b"hunter2".hex() not in caplog.text
 
 
 async def test_a_packet_we_cannot_parse_is_dropped_quietly(listener, discovered):
