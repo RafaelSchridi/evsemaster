@@ -11,24 +11,32 @@ from .capabilities import Capabilities
 from .capabilities import for_device as capabilities_for
 from .data_types import (
     Action,
+    ChargeRecord,
     ChargingStatus,
     CommandEnum,
     CurrentStateEnum,
     DataPacket,
     EvseDeviceInfo,
     EvseStatus,
+    LanguageEnum,
     NotLoggedInError,
     UnsupportedOperationError,
+    WeeklyPlan,
     now_aware,
 )
 from .protocol import (
+    WEEKLY_PLAN_SIZE,
     ZERO_SERIAL,
     build_packet,
+    build_record_ack,
     build_start_charging_payload,
     build_stop_charging_payload,
+    build_weekly_plan_payload,
+    parse_charge_record,
     parse_charging_status,
     parse_device_info,
     parse_status,
+    parse_weekly_plan,
     shanghai_offset,
 )
 
@@ -48,6 +56,14 @@ DEFAULT_SEND_PORT = 7248
 # Clients rewrite the clock often (the vendor app every 10 s), so a smaller skew is drift or a timezone disagreement
 # that the next write moves again. Only a skew that survives our own write can be aimed at.
 CLOCK_SKEW_THRESHOLD = 86400
+
+HISTORY_REQUEST_INTERVAL = 0.25  # 4/s lost ~6% of replies on an EC311S; the misses are asked again
+HISTORY_REPLY_WAIT = 2.0
+HISTORY_PASSES = 4
+
+SETTING_REREAD_DELAY = 2  # set replies echo the new value but can go missing, so a get follows every set
+LANGUAGE_GET = bytes([Action.GET, 0])
+WEEKLY_PLAN_GET = bytes([Action.GET]) + bytes(WEEKLY_PLAN_SIZE - 1)  # the app's padding; an EC311S takes a bare [2]
 
 
 class EvseDevice:
@@ -72,6 +88,11 @@ class EvseDevice:
         self._status: EvseStatus | None = None
         self._device_info: EvseDeviceInfo | None = None
         self._charging_status: ChargingStatus | None = None
+        self._weekly_plan: WeeklyPlan | None = None
+        self._rereads: dict[CommandEnum, asyncio.TimerHandle] = {}
+        self._history: dict[int, ChargeRecord | None] | None = None
+        self._history_count: asyncio.Future | None = None
+        self._history_lock = asyncio.Lock()
         self._last_alive: datetime | None = None
         self._last_heading: datetime | None = None
         self._last_login_attempt: datetime | None = None
@@ -201,6 +222,8 @@ class EvseDevice:
         self._authenticated = False
         if self._auto_login_task and not self._auto_login_task.done():
             self._auto_login_task.cancel()
+        for timer in self._rereads.values():
+            timer.cancel()
 
     def _bind(self, serial: str, addr: tuple[str, int]) -> None:
         """Learn serial and source address from an incoming packet."""
@@ -270,8 +293,24 @@ class EvseDevice:
                 if self._device_info:
                     self._device_info.configured_max_amps = amperage
                     self.send_event(EvseDeviceInfo.__name__, self._device_info)
+            elif cmd == CommandEnum.LANGUAGE_EVENT:
+                if packet.length() >= 2 and self._device_info:
+                    self._device_info.language = LanguageEnum(packet.get_int(1, 1))
+                    self.send_event(EvseDeviceInfo.__name__, self._device_info)
+            elif cmd == CommandEnum.WEEKLY_PLAN_EVENT:
+                plan = parse_weekly_plan(packet)
+                if plan:
+                    self._weekly_plan = plan
+                    self.send_event(WeeklyPlan.__name__, plan)
             elif cmd == CommandEnum.SYSTEM_TIME_EVENT:
                 self._handle_system_time(packet)
+            elif cmd in (CommandEnum.CURRENT_CHARGE_RECORD_EVENT, CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT):
+                self._handle_charge_record(packet, cmd)
+            elif cmd == CommandEnum.HISTORY_COUNT_EVENT:
+                if self._history_count and not self._history_count.done() and packet.length() >= 5:
+                    self._history_count.set_result(packet.get_int(1, 4))
+            elif cmd == CommandEnum.HISTORY_RECORD_EVENT:
+                self._handle_history_record(packet)
             else:
                 log.debug(f"Unhandled command: {cmd.name}")
         except Exception as err:
@@ -284,6 +323,7 @@ class EvseDevice:
         if self._device_info:
             device_info.nickname = self._device_info.nickname
             device_info.configured_max_amps = self._device_info.configured_max_amps
+            device_info.language = self._device_info.language
         self._device_info = device_info
         self.send_event(EvseDeviceInfo.__name__, device_info)
 
@@ -315,6 +355,26 @@ class EvseDevice:
             self._time_delta = math.ceil(delta / 60) * 60
             log.info("Device clock is %d s off, correcting schedules for it", self._time_delta)
 
+    def _handle_charge_record(self, packet: DataPacket, cmd: CommandEnum) -> None:
+        """Hand a finished session to the consumer and acknowledge it, which ends its replay."""
+        record = parse_charge_record(packet, 0, self._shanghai_epoch_to_datetime)
+        if not record:
+            return
+        # the charger keeps it in its history, but the vendor app only ever lists records it acknowledged itself
+        if cmd == CommandEnum.CURRENT_CHARGE_RECORD_EVENT:
+            self.send_command(CommandEnum.CURRENT_CHARGE_RECORD_RESPONSE, build_record_ack(packet))
+        else:
+            self.send_command(CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_RESPONSE, build_record_ack(packet))
+        self.send_event(ChargeRecord.__name__, record)
+
+    def _handle_history_record(self, packet: DataPacket) -> None:
+        if self._history is None or packet.length() < 9:
+            return
+        # flag 1 carries a record; 3 marks an empty slot or one past the capacity
+        has_record = packet.get_int(8, 1) == 1
+        record = parse_charge_record(packet, 9, self._shanghai_epoch_to_datetime) if has_record else None
+        self._history[packet.get_int(4, 4)] = record
+
     async def request_status(self) -> bool:
         """Request current EVSE status and charging status."""
         if not self.is_authorised:
@@ -331,6 +391,8 @@ class EvseDevice:
         await self.set_device_time()
         self.send_command(CommandEnum.NICKNAME_REQUEST, bytes([Action.GET]))
         self.send_command(CommandEnum.OUTPUT_AMPERAGE_REQUEST, bytes([Action.GET]))
+        self.send_command(CommandEnum.LANGUAGE_REQUEST, LANGUAGE_GET)
+        self.send_command(CommandEnum.WEEKLY_PLAN_REQUEST, WEEKLY_PLAN_GET)
         return await self.request_status()
 
     async def start_charging(
@@ -436,6 +498,73 @@ class EvseDevice:
         self.send_command(CommandEnum.OUTPUT_AMPERAGE_REQUEST, extra_payload)
         return True
 
+    async def set_language(self, language: LanguageEnum) -> bool:
+        """Set the language of the charger's display."""
+        if not self.is_authorised:
+            raise NotLoggedInError("Please login before setting the language")
+        if language == LanguageEnum.UNKNOWN:
+            raise ValueError("UNKNOWN is not a language the charger can be set to")
+        self.send_command(CommandEnum.LANGUAGE_REQUEST, bytes([Action.SET, language]))
+        self._reread_later(CommandEnum.LANGUAGE_REQUEST, LANGUAGE_GET)
+        return True
+
+    async def set_weekly_plan(self, plan: WeeklyPlan) -> bool:
+        """Replace the charger's weekly plan; all seven days are written at once."""
+        if not self.is_authorised:
+            raise NotLoggedInError("Please login before setting the weekly plan")
+        for slot in plan.slots:
+            if slot.enabled and not slot.duration_minutes:
+                raise ValueError("An enabled day needs a duration of 1 to 1440 minutes")
+        if self._time_delta:
+            log.warning("%s runs its weekly plan on a clock %d s off from ours", self, self._time_delta)
+        self.send_command(CommandEnum.WEEKLY_PLAN_REQUEST, build_weekly_plan_payload(plan))
+        self._reread_later(CommandEnum.WEEKLY_PLAN_REQUEST, WEEKLY_PLAN_GET)
+        return True
+
+    def _reread_later(self, cmd: CommandEnum, payload: bytes) -> None:
+        """Get a setting again shortly after setting it."""
+        if timer := self._rereads.get(cmd):
+            timer.cancel()
+        self._rereads[cmd] = asyncio.get_running_loop().call_later(
+            SETTING_REREAD_DELAY, self.send_command, cmd, payload
+        )
+
+    async def read_history(self) -> dict[int, ChargeRecord]:
+        """Read every record in the charger's history ring, keyed by slot; takes about 90 s."""
+        if not self.is_authorised:
+            raise NotLoggedInError("Please login before reading history")
+        async with self._history_lock:
+            capacity = await self._read_history_capacity()
+            self._history = {}
+            try:
+                missing = list(range(1, capacity + 1))
+                for _ in range(HISTORY_PASSES):
+                    for index in missing:
+                        self.send_command(CommandEnum.HISTORY_RECORD_REQUEST, struct.pack(">BI", 1, index))
+                        await asyncio.sleep(HISTORY_REQUEST_INTERVAL)
+                    await asyncio.sleep(HISTORY_REPLY_WAIT)
+                    missing = [index for index in missing if index not in self._history]
+                    if not missing:
+                        break
+                if missing:
+                    log.warning("No history reply for %d of %d slots from %s", len(missing), capacity, self)
+                return {index: record for index, record in self._history.items() if record}
+            finally:
+                self._history = None
+
+    async def _read_history_capacity(self) -> int:
+        """The count reply's bytes 1-4, which hold the ring's capacity rather than a count."""
+        for _ in range(HISTORY_PASSES):
+            self._history_count = asyncio.get_running_loop().create_future()
+            self.send_command(CommandEnum.HISTORY_COUNT_REQUEST, bytes([1]))
+            try:
+                return await asyncio.wait_for(self._history_count, HISTORY_REPLY_WAIT)
+            except TimeoutError:
+                continue
+            finally:
+                self._history_count = None
+        raise TimeoutError(f"{self} did not answer the history count")
+
     async def set_device_time(self, dt: datetime | None = None) -> bool:
         """Set the EVSE device's internal clock.
 
@@ -504,3 +633,7 @@ class EvseDevice:
     def get_latest_charging_status(self) -> ChargingStatus | None:
         """Get the latest charging status."""
         return self._charging_status
+
+    def get_latest_weekly_plan(self) -> WeeklyPlan | None:
+        """Get the latest weekly plan."""
+        return self._weekly_plan

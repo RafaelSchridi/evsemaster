@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, time
 from enum import IntEnum
 from struct import unpack
 
@@ -100,10 +100,10 @@ class CommandEnum(IntEnum):
     SYSTEM_TIME_REQUEST = 0x8101  # 33025
     SYSTEM_TIME_EVENT = 0x0101  # 257
 
-    #### Haven't touched yet ####s
+    # Charge records
     CURRENT_CHARGE_RECORD_EVENT = 0x0009
     CURRENT_CHARGE_RECORD_RESPONSE = 0x8009
-    UPLOAD_LOCAL_CHARGE_RECORD = 0x000A
+    UPLOAD_LOCAL_CHARGE_RECORD_EVENT = 0x000A
     UPLOAD_LOCAL_CHARGE_RECORD_RESPONSE = 0x800A
     HISTORY_COUNT_REQUEST = 0x800B
     HISTORY_COUNT_EVENT = 0x000B
@@ -147,16 +147,86 @@ class CurrentStateEnum(FirmwareEnum):
     CHARGING_RESERVATION = 20
 
 
+class FaultEnum(IntEnum):
+    """Fault n is bit 31 - n of the status error field; names are the vendor app's."""
+
+    RELAY_STUCK_L1 = 0
+    RELAY_STUCK_L2 = 1
+    RELAY_STUCK_L3 = 2
+    OFFLINE = 3
+    CC_ERROR = 4
+    CP_ERROR = 5
+    EMERGENCY_STOP = 6
+    OVER_TEMPERATURE_INNER = 7
+    OVER_TEMPERATURE_OUTER = 8
+    UNKNOWN_ERROR = 9
+    LEAKAGE_PROTECTION = 10
+    SHORT_CIRCUIT = 11
+    OVER_CURRENT = 12
+    NOT_GROUNDED = 13
+    OVER_VOLTAGE = 14
+    LOW_VOLTAGE = 15
+    # the app names none of 16-23
+    FAULT_16 = 16
+    FAULT_17 = 17
+    FAULT_18 = 18
+    FAULT_19 = 19
+    FAULT_20 = 20
+    FAULT_21 = 21
+    FAULT_22 = 22
+    FAULT_23 = 23
+    NO_VENTILATION = 24
+    INPUT_POWER_ERROR = 25
+    MAINS_OVERLOAD = 26
+    DIODE_SHORT_CIRCUIT = 27
+    RTC_FAILURE = 28
+    FLASH_FAILURE = 29
+    EEPROM_FAILURE = 30
+    METERING_MODULE_FAILURE = 31
+
+
+class LanguageEnum(FirmwareEnum):
+    UNKNOWN = 999
+    ENGLISH = 1
+    ITALIAN = 2
+    GERMAN = 3
+    FRENCH = 4
+    SPANISH = 5
+    HEBREW = 6
+    POLISH = 7
+    TURKISH = 8
+    CHINESE_TRADITIONAL = 9
+
+
+class StartTypeEnum(FirmwareEnum):
+    UNKNOWN = 999
+    CLIENT = 1
+    PLUG_AND_CHARGE = 3  # started by "PAP"
+    SCHEDULE = 4  # started by "Clock": the weekly plan
+
+
+class StopReasonEnum(FirmwareEnum):
+    UNKNOWN = 999
+    RESERVATION_CANCELLED = 0
+    CLIENT = 11
+    AUTO_STOP = 14
+    ENERGY_LIMIT = 15
+    TIME_LIMIT = 16
+    UNPLUGGED = 17
+    POWER_LOSS = 255
+
+
 class EvseDeviceInfo(BaseSchema):
     type: int = Field(default=0)
     brand: str = Field(default="Brand")
     model: str = Field(default="Model")
-    hardware_version: str = Field(default="0.0")
+    firmware_version: str = Field(default="0.0")  # what the vendor app shows as "Firmware version"
     max_power: int = Field(default=0)
     max_amps: int = Field(default=16)
     serial_number: str = Field(default="00000000")  # 8 byte hex string
     nickname: str = Field(default="")
     configured_max_amps: int = Field(default=16)  # User-configured max amps
+    language: LanguageEnum | None = None
 
 
 class DiscoveredDevice(BaseSchema):
@@ -167,7 +237,7 @@ class DiscoveredDevice(BaseSchema):
     port: int
     brand: str | None = None
     model: str | None = None
-    hardware_version: str | None = None
+    firmware_version: str | None = None
     max_amps: int | None = None
 
 
@@ -179,7 +249,7 @@ class EvseStatus(BaseSchema):
     plug_state: PlugStateEnum
     output_state: int
     current_state: CurrentStateEnum
-    errors: int
+    faults: list[FaultEnum] = Field(default_factory=list)  # every fault that is set, lowest number first
     l1_voltage: float = Field(default=0.0)
     l1_amps: float = Field(default=0.0)
     l2_voltage: float = Field(default=0.0)
@@ -210,6 +280,40 @@ class ChargingStatus(BaseSchema):
     charge_price: float
     fee_type: int
     charge_fee: float
+
+
+class ChargeRecord(BaseSchema):
+    """One finished session, as 0x0009, 0x000A and the history (0x000C) carry it."""
+
+    line_id: int
+    started_by: str
+    stopped_by: str
+    charge_id: str
+    has_reservation: bool
+    start_type: StartTypeEnum
+    charge_type: int
+    max_duration_minutes: int | None
+    max_energy_kwh: float | None
+    stop_reason: StopReasonEnum
+    reservation_datetime: datetime | None
+    start_datetime: datetime | None
+    stop_datetime: datetime | None
+    duration_seconds: int
+    start_kwh_counter: float
+    stop_kwh_counter: float
+    charge_kwh: float
+
+
+class WeeklyPlanSlot(BaseSchema):
+    enabled: bool = False
+    start: time = time(0, 0)
+    duration_minutes: int = Field(default=0, ge=0, le=1440)
+
+
+class WeeklyPlan(BaseSchema):
+    """Seven daily charge windows, Monday first; plugging in during one charges for the rest of it."""
+
+    slots: list[WeeklyPlanSlot] = Field(min_length=7, max_length=7)
 
 
 def _log_mismatch(command: CommandEnum, checksum: int, tail: int, declared: int, received: int) -> None:

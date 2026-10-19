@@ -69,7 +69,10 @@ fixture; never bind 28376 in a test.
   `login()` is load-bearing.
 - Every outgoing packet carries the device serial once an inbound packet binds it; some
   firmware ignores zero-serial requests.
-- `UPLOAD_LOCAL_CHARGE_RECORD` (0x000A) arrives constantly and is deliberately unhandled.
+- Charge records (0x0009, 0x000A) are acknowledged as they arrive, a user decision (2026-10-16): it ends the
+  replay, but the vendor app lists only records it acknowledged itself, so it never shows those sessions.
+- One datagram can carry several frames; `split_frames` in the listener separates them. Replies also go missing,
+  so a settings set is followed by a get (`_reread_later`), and history reads retry.
 - Per-model behaviour differences belong in `capabilities.py`, not in `if model ==` branches.
 
 ### Clocks
@@ -90,3 +93,6 @@ fixture; never bind 28376 in a test.
 
 Bump `version` in `pyproject.toml`. The HA integration pins the exact version in its
 `manifest.json` (`evsemaster==x.y.z`), so update that alongside a release.
+
+Every breaking change goes into `docs/breaking-changes.md` under the release that makes it, as an old → new table.
+Release notes link there instead of listing renames.

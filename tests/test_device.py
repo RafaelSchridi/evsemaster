@@ -2,15 +2,26 @@
 
 import asyncio
 import struct
-from datetime import timedelta
+from datetime import time, timedelta
 
 import pytest
 
-from evsemaster import Action, CommandEnum, EvseListener, NotLoggedInError, now_aware
+from evsemaster import (
+    Action,
+    ChargeRecord,
+    CommandEnum,
+    EvseListener,
+    LanguageEnum,
+    NotLoggedInError,
+    WeeklyPlan,
+    WeeklyPlanSlot,
+    now_aware,
+)
+from evsemaster import device as device_module
 from evsemaster.data_types import CurrentStateEnum, UnsupportedOperationError
 from evsemaster.device import HEADING_TIMEOUT
 from evsemaster.protocol import shanghai_offset
-from evsemaster.testing import FakeEvse, charging_payload
+from evsemaster.testing import FakeEvse, charge_record_payload, charging_payload, device_info_payload
 
 SERIAL = "aa" * 8
 MONTH = 31 * 86400
@@ -185,12 +196,22 @@ async def test_a_pushed_charging_status_is_acknowledged(device, evse):
     assert evse.payloads[CommandEnum.CURRENT_CHARGING_STATUS_RESPONSE] == b"\x00"
 
 
-@pytest.mark.parametrize("command", ["request_status", "start_charging", "stop_charging", "set_nickname"])
-async def test_commands_are_refused_until_a_login_succeeds(listener, evse, command):
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        ("request_status", ()),
+        ("start_charging", ()),
+        ("stop_charging", ()),
+        ("set_nickname", ("Shed",)),
+        ("set_language", (LanguageEnum.GERMAN,)),
+        ("set_weekly_plan", (WeeklyPlan(slots=[WeeklyPlanSlot()] * 7),)),
+        ("read_history", ()),
+    ],
+)
+async def test_commands_are_refused_until_a_login_succeeds(listener, evse, command, args):
     # no password, so it never logs itself in when the charger announces
     device = await listener.async_add_device("127.0.0.1", "")
     assert not device.is_authorised
-    args = ("Shed",) if command == "set_nickname" else ()
     with pytest.raises(NotLoggedInError):
         await getattr(device, command)(*args)
 
@@ -338,3 +359,130 @@ async def test_a_bs20_allows_an_amperage_change_while_charging(listener, listen_
         assert await until(lambda: 10 in evse.amps_set)
     finally:
         evse.stop()
+
+
+@pytest.fixture
+def fast_rereads(monkeypatch):
+    monkeypatch.setattr(device_module, "SETTING_REREAD_DELAY", 0.05)
+    monkeypatch.setattr(device_module, "HISTORY_REQUEST_INTERVAL", 0.01)
+    monkeypatch.setattr(device_module, "HISTORY_REPLY_WAIT", 0.2)
+
+
+@pytest.mark.parametrize(
+    ("event", "response"),
+    [
+        (CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT, CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_RESPONSE),
+        (CommandEnum.CURRENT_CHARGE_RECORD_EVENT, CommandEnum.CURRENT_CHARGE_RECORD_RESPONSE),
+    ],
+)
+async def test_a_charge_record_is_handed_over_and_acknowledged(device, evse, event, response):
+    """Without the acknowledgement the charger replays the record every few seconds, forever."""
+    assert await device.login()
+    evse.upload_record(
+        charge_record_payload(charge_id="202610161200", kwh=850),
+        current=event != CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT,
+    )
+
+    assert await until(lambda: response in evse.payloads)
+    assert evse.payloads[response] == b"\x01202610161200\x00\x00\x00\x00\x01"
+    records = [data for name, data in device.events if name == ChargeRecord.__name__]
+    assert [record.charge_kwh for record in records] == [8.5]
+
+
+async def test_history_asks_again_for_replies_that_went_missing(listener, listen_port, fast_rereads):
+    evse = await FakeEvse(
+        SERIAL,
+        client_port=listen_port,
+        history_capacity=5,
+        history={1: charge_record_payload("a"), 2: charge_record_payload("b")},
+    ).start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456")
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        evse.drop_history_once = {2}
+
+        history = await device.read_history()
+        assert {slot: record.charge_id for slot, record in history.items()} == {1: "a", 2: "b"}
+        assert evse.received.count(CommandEnum.HISTORY_RECORD_REQUEST) == 6, "slot 2 is asked twice, the rest once"
+    finally:
+        evse.stop()
+
+
+async def test_history_leaves_out_empty_slots(listener, listen_port, fast_rereads):
+    evse = await FakeEvse(
+        SERIAL, client_port=listen_port, history_capacity=4, history={3: charge_record_payload()}
+    ).start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456")
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        assert list(await device.read_history()) == [3]
+    finally:
+        evse.stop()
+
+
+async def test_language_is_read_at_login_and_reread_after_a_set(device, evse, fast_rereads):
+    assert await device.login()
+    assert await until(lambda: device.get_latest_device_info().language == LanguageEnum.ENGLISH)
+
+    assert await device.set_language(LanguageEnum.GERMAN)
+    assert await until(lambda: device.get_latest_device_info().language == LanguageEnum.GERMAN)
+    assert evse.language == 3
+    assert await until(lambda: evse.received.count(CommandEnum.LANGUAGE_REQUEST) == 3), "no get after the set"
+    with pytest.raises(ValueError):
+        await device.set_language(LanguageEnum.UNKNOWN)
+
+
+@pytest.mark.parametrize("setter", ["language", "plan"])
+async def test_a_set_reply_alone_updates_the_setting(device, evse, monkeypatch, setter):
+    """An EC311S echoes the written value in its set reply; the re-read is only a second chance."""
+    monkeypatch.setattr(device_module, "SETTING_REREAD_DELAY", 60)
+    assert await device.login()
+    assert await until(lambda: device.get_latest_weekly_plan() is not None)
+    if setter == "language":
+        await device.set_language(LanguageEnum.POLISH)
+        assert await until(lambda: device.get_latest_device_info().language == LanguageEnum.POLISH)
+    else:
+        monday = WeeklyPlanSlot(enabled=True, start=time(7, 0), duration_minutes=30)
+        await device.set_weekly_plan(WeeklyPlan(slots=[monday] + [WeeklyPlanSlot()] * 6))
+        assert await until(lambda: device.get_latest_weekly_plan().slots[0] == monday)
+
+
+async def test_weekly_plan_is_read_at_login_and_reread_after_a_set(device, evse, fast_rereads):
+    assert await device.login()
+    assert await until(lambda: device.get_latest_weekly_plan() is not None)
+    assert not any(slot.enabled for slot in device.get_latest_weekly_plan().slots)
+
+    friday = WeeklyPlanSlot(enabled=True, start=time(18, 0), duration_minutes=120)
+    plan = WeeklyPlan(slots=[WeeklyPlanSlot()] * 4 + [friday] + [WeeklyPlanSlot()] * 2)
+    assert await device.set_weekly_plan(plan)
+    assert await until(lambda: device.get_latest_weekly_plan().slots[4].enabled)
+    assert device.get_latest_weekly_plan() == plan
+    assert await until(lambda: evse.received.count(CommandEnum.WEEKLY_PLAN_REQUEST) == 3), "no get after the set"
+
+
+async def test_an_enabled_day_without_a_duration_is_refused(device, evse):
+    assert await device.login()
+    plan = WeeklyPlan(slots=[WeeklyPlanSlot(enabled=True, start=time(8, 0))] + [WeeklyPlanSlot()] * 6)
+    with pytest.raises(ValueError, match="duration"):
+        await device.set_weekly_plan(plan)
+
+
+async def test_settings_survive_a_new_login_payload(device, evse):
+    """A login payload carries no settings; merging it must not reset the ones read since."""
+    assert await device.login()
+    assert await until(lambda: device.get_latest_device_info().language == LanguageEnum.ENGLISH)
+    evse.send(CommandEnum.LOGIN_EVENT, device_info_payload())
+    assert await until(lambda: sum(name == "EvseDeviceInfo" for name, _ in device.events) >= 4)
+    info = device.get_latest_device_info()
+    assert (info.language, info.nickname) == (LanguageEnum.ENGLISH, "Garage")
+
+
+async def test_a_closed_device_sends_no_pending_reread(device, evse):
+    assert await device.login()
+    await device.set_language(LanguageEnum.GERMAN)
+    await device.set_weekly_plan(WeeklyPlan(slots=[WeeklyPlanSlot()] * 7))
+    device.close()
+    assert len(device._rereads) == 2
+    assert all(timer.cancelled() for timer in device._rereads.values()), "a closed device would still send"

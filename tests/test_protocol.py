@@ -2,21 +2,26 @@
 
 import logging
 import struct
-from datetime import timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
-from evsemaster import CommandEnum, DataPacket
+from evsemaster import CommandEnum, DataPacket, FaultEnum, StartTypeEnum, StopReasonEnum, WeeklyPlan, WeeklyPlanSlot
 from evsemaster.data_types import HEADER, TAIL, _mismatched, now_aware
 from evsemaster.protocol import (
     build_packet,
+    build_record_ack,
     build_start_charging_payload,
     build_stop_charging_payload,
+    build_weekly_plan_payload,
+    parse_charge_record,
     parse_charging_status,
     parse_device_info,
     parse_status,
+    parse_weekly_plan,
+    split_frames,
 )
-from evsemaster.testing import charging_payload, device_info_payload, status_payload
+from evsemaster.testing import charge_record_payload, charging_payload, device_info_payload, status_payload
 
 SERIAL = "1122334455667788"
 UNASSIGNED = 0x7777
@@ -107,6 +112,19 @@ def test_a_bad_checksum_is_logged_but_the_packet_is_kept(caplog):
     assert sum(r.levelno == logging.DEBUG for r in mismatches) == 2, "debug logging must show every occurrence"
 
 
+def test_a_datagram_carrying_two_frames_is_split():
+    """Seen on an EC311S: a heading with a status frame behind it, and a weekly plan set reply with the get reply."""
+    heading = build_packet(CommandEnum.HEADING_EVENT, SERIAL, "")
+    status = build_packet(CommandEnum.CURRENT_STATUS_EVENT, SERIAL, "", status_payload())
+    assert split_frames(heading + status) == [heading, status]
+    assert split_frames(status) == [status]
+
+
+def test_trailing_bytes_that_are_not_a_frame_stay_with_the_frame():
+    heading = build_packet(CommandEnum.HEADING_EVENT, SERIAL, "")
+    assert split_frames(heading + b"\x00\x01") == [heading + b"\x00\x01"]
+
+
 def test_short_and_malformed_packets_are_rejected():
     with pytest.raises(ValueError):
         DataPacket(b"\x06\x01" + bytes(10))
@@ -158,6 +176,22 @@ def test_measurements_without_a_reading_parse_as_zero():
     assert status.current_power == 0
     assert (status.l2_voltage, status.l2_amps, status.l3_voltage, status.l3_amps) == (0.0, 0.0, 0.0, 0.0)
     assert (status.l1_voltage, status.l1_amps) == (230.1, 16.0)
+
+
+@pytest.mark.parametrize(
+    ("errors", "faults"),
+    [
+        (0, []),
+        (1 << 31, [FaultEnum.RELAY_STUCK_L1]),
+        (1 << 25, [FaultEnum.EMERGENCY_STOP]),
+        (1 << 25 | 1, [FaultEnum.EMERGENCY_STOP, FaultEnum.METERING_MODULE_FAILURE]),
+        (1 << 15, [FaultEnum.FAULT_16]),
+    ],
+)
+def test_fault_n_is_bit_31_minus_n(errors, faults):
+    """emproto reads bit n, which names the wrong fault; the app shows only the first of several."""
+    status = parse_status(packet(CommandEnum.CURRENT_STATUS_EVENT, status_payload(errors=errors)))
+    assert status.faults == faults
 
 
 def test_status_too_short_to_parse_is_dropped():
@@ -224,3 +258,57 @@ def test_start_charging_payload_flags_a_future_start_as_a_reservation(offset, ex
 def test_stop_charging_payload_names_the_stopper():
     """The firmware reads 16 bytes of user id whatever we send: a 1-byte stop recorded `<epoch>masterpy`."""
     assert build_stop_charging_payload("evsemasterpy") == b"\x01evsemasterpy" + bytes(4)
+
+
+def epoch_as_utc(epoch: int) -> datetime:
+    return datetime.fromtimestamp(epoch, UTC)
+
+
+@pytest.mark.parametrize("offset", [0, 9], ids=["upload", "history"])
+def test_a_charge_record_parses_at_both_offsets(offset):
+    record_bytes = charge_record_payload(start=1_792_000_000, duration=5400, kwh=1234, stop_reason=16)
+    header = struct.pack(">IIB", 300, 59, 1) if offset else b""
+    record = parse_charge_record(packet(CommandEnum.HISTORY_RECORD_EVENT, header + record_bytes), offset, epoch_as_utc)
+    assert (record.started_by, record.stopped_by, record.charge_id) == ("evsemasterpy", "evsemasterpy", "202610161200")
+    assert record.start_type == StartTypeEnum.CLIENT
+    assert record.stop_reason == StopReasonEnum.TIME_LIMIT
+    assert record.start_datetime == epoch_as_utc(1_792_000_000)
+    assert record.stop_datetime == epoch_as_utc(1_792_005_400)
+    assert record.duration_seconds == 5400
+    assert (record.start_kwh_counter, record.stop_kwh_counter, record.charge_kwh) == (1000.0, 1012.34, 12.34)
+    assert (record.max_duration_minutes, record.max_energy_kwh) == (None, None)
+
+
+def test_a_charge_record_without_times_reads_none():
+    """Never-written fields are 0 or all FF; neither is a moment."""
+    record_bytes = bytearray(charge_record_payload())
+    struct.pack_into(">III", record_bytes, 60, 0, 0xFFFFFFFF, 0)
+    record = parse_charge_record(
+        packet(CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT, bytes(record_bytes)), 0, epoch_as_utc
+    )
+    assert (record.reservation_datetime, record.start_datetime, record.stop_datetime) == (None, None, None)
+
+
+def test_record_ack_names_the_charge_id():
+    ack = build_record_ack(
+        packet(CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT, charge_record_payload("PAP   1792000000"))
+    )
+    assert ack == b"\x01PAP   1792000000\x01"
+
+
+def test_weekly_plan_round_trips():
+    evening = WeeklyPlanSlot(enabled=True, start=time(22, 30), duration_minutes=480)
+    plan = WeeklyPlan(slots=[evening, WeeklyPlanSlot(), evening, WeeklyPlanSlot(), WeeklyPlanSlot(), evening, evening])
+    payload = build_weekly_plan_payload(plan)
+    assert len(payload) == 64
+    assert payload[1:10] == bytes.fromhex("03 16 1e 01e0 ffffffff")
+    assert payload[10:19] == bytes.fromhex("01 00 00 0000 ffffffff")
+    assert parse_weekly_plan(packet(CommandEnum.WEEKLY_PLAN_EVENT, b"\x02" + payload[1:])) == plan
+
+
+def test_any_slot_state_but_1_reads_as_on():
+    """The app's parser skips only state 1, and so do we."""
+    payload = bytes([2]) + bytes.fromhex("02 08 00 003c 00000000") + bytes.fromhex("01 00 00 0000 00000000") * 6
+    plan = parse_weekly_plan(packet(CommandEnum.WEEKLY_PLAN_EVENT, payload))
+    assert plan.slots[0] == WeeklyPlanSlot(enabled=True, start=time(8, 0), duration_minutes=60)
+    assert not any(slot.enabled for slot in plan.slots[1:])

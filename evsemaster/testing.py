@@ -31,7 +31,12 @@ def device_info_payload(brand: str = "BESEN", model: str = "BS20", max_amps: int
 
 
 def status_payload(
-    three_phase: bool = True, state: int = 13, plug: int = 4, power: int = 0, emergency_stop: bool = False
+    three_phase: bool = True,
+    state: int = 13,
+    plug: int = 4,
+    power: int = 0,
+    emergency_stop: bool = False,
+    errors: int = 0,
 ) -> bytes:
     """Payload of a status event; single-phase chargers omit the L2/L3 block."""
     payload = bytearray(33 if three_phase else 25)
@@ -46,6 +51,7 @@ def status_payload(
     struct.pack_into(">B", payload, 18, plug)
     struct.pack_into(">B", payload, 19, 1)
     struct.pack_into(">B", payload, 20, state)
+    struct.pack_into(">I", payload, 21, errors)
     if three_phase:
         struct.pack_into(">H", payload, 25, 2302)
         struct.pack_into(">H", payload, 27, 1500)
@@ -69,6 +75,29 @@ def charging_payload(amps: int = 16, duration: int = 3600, kwh: int = 1234) -> b
     return bytes(payload)
 
 
+def charge_record_payload(
+    charge_id: str = "202610161200",
+    start: int = 1_792_000_000,
+    duration: int = 3600,
+    kwh: int = 1234,
+    stop_reason: int = 11,
+    started_by: str = "evsemasterpy",
+    stopped_by: str = "evsemasterpy",
+) -> bytes:
+    """A charge record as 0x0009 and 0x000A carry it, and 0x000C from byte 9; times are Shanghai epochs."""
+    payload = bytearray(96)
+    payload[0] = 1
+    payload[1 : 1 + len(started_by)] = started_by.encode()
+    payload[17 : 17 + len(stopped_by)] = stopped_by.encode()
+    payload[33 : 33 + len(charge_id)] = charge_id.encode()
+    struct.pack_into(">BBB", payload, 49, 0, 1, 1)
+    struct.pack_into(">HHH", payload, 52, 65535, 65535, 65535)
+    struct.pack_into(">BB", payload, 58, stop_reason, 1)
+    struct.pack_into(">IIIII", payload, 60, 0, start, start + duration, duration, 100_000)
+    struct.pack_into(">II", payload, 80, 100_000 + kwh, kwh)
+    return bytes(payload)
+
+
 class FakeEvse(asyncio.DatagramProtocol):
     """An EVSE on loopback. Bind each one to its own 127.0.0.x to run several at once."""
 
@@ -88,6 +117,10 @@ class FakeEvse(asyncio.DatagramProtocol):
         announce_interval: float = 0.5,
         heading_interval: float = 1.0,
         clock_skew: int = 0,
+        errors: int = 0,
+        language: int = 1,
+        history: dict[int, bytes] | None = None,
+        history_capacity: int = 300,
     ):
         self.serial = serial
         self.password = password
@@ -104,6 +137,14 @@ class FakeEvse(asyncio.DatagramProtocol):
         self.announce_interval = announce_interval
         self.heading_interval = heading_interval
         self.clock_skew = clock_skew
+        self.errors = errors
+        self.language = language
+        # every slot off, as an EC311S reports a plan nobody set
+        self.weekly_plan = bytes([1, 0, 0, 0, 0, 0, 0, 0, 0]) * 7
+        self.history = history or {}
+        self.history_capacity = history_capacity
+        # history requests the fake leaves unanswered once, as a real charger loses some
+        self.drop_history_once: set[int] = set()
         self.received: list[CommandEnum] = []
         self.payloads: dict[CommandEnum, bytes] = {}
         self.amps_set: list[int] = []
@@ -164,6 +205,13 @@ class FakeEvse(asyncio.DatagramProtocol):
             ("127.0.0.1", self.client_port),
         )
 
+    def upload_record(self, record: bytes, current: bool = False) -> None:
+        """A finished session's record: 0x000A, replayed by a real charger until acknowledged, or 0x0009."""
+        if current:
+            self.send(CommandEnum.CURRENT_CHARGE_RECORD_EVENT, record)
+        else:
+            self.send(CommandEnum.UPLOAD_LOCAL_CHARGE_RECORD_EVENT, record)
+
     def end_session(self) -> None:
         """Forget the client, as a charger does when it is power cycled."""
         if self._heading_task:
@@ -189,7 +237,10 @@ class FakeEvse(asyncio.DatagramProtocol):
             if not self._heading_task:
                 self._heading_task = asyncio.create_task(self._headings())
         elif cmd == CommandEnum.STATUS_REQUEST:
-            self.send(CommandEnum.STATUS_EVENT, status_payload(self.three_phase, state=self.state, plug=self.plug))
+            self.send(
+                CommandEnum.STATUS_EVENT,
+                status_payload(self.three_phase, state=self.state, plug=self.plug, errors=self.errors),
+            )
         elif cmd == CommandEnum.CHARGING_STATUS_REQUEST:
             self.send(CommandEnum.CHARGING_STATUS_EVENT, charging_payload())
         elif cmd == CommandEnum.SYSTEM_TIME_REQUEST:
@@ -203,6 +254,24 @@ class FakeEvse(asyncio.DatagramProtocol):
                 self.amps_set.append(payload[1])
             amps = self.amps_set[-1] if self.amps_set else 16
             self.send(CommandEnum.OUTPUT_AMPERAGE_EVENT, bytes([Action.GET, amps]))
+        elif cmd == CommandEnum.LANGUAGE_REQUEST:
+            if payload[:1] == bytes([Action.SET]):
+                self.language = payload[1]
+            self.send(CommandEnum.LANGUAGE_EVENT, bytes([payload[0], self.language]))
+        elif cmd == CommandEnum.WEEKLY_PLAN_REQUEST:
+            if payload[:1] == bytes([Action.SET]):
+                self.weekly_plan = payload[1:64]
+            self.send(CommandEnum.WEEKLY_PLAN_EVENT, payload[:1] + self.weekly_plan)
+        elif cmd == CommandEnum.HISTORY_COUNT_REQUEST:
+            self.send(CommandEnum.HISTORY_COUNT_EVENT, struct.pack(">BIII", 0, self.history_capacity, 0, 0))
+        elif cmd == CommandEnum.HISTORY_RECORD_REQUEST:
+            index = struct.unpack(">I", payload[1:5])[0]
+            if index in self.drop_history_once:
+                self.drop_history_once.discard(index)
+                return
+            record = self.history.get(index)
+            header = struct.pack(">IIB", self.history_capacity, index, 1 if record else 3)
+            self.send(CommandEnum.HISTORY_RECORD_EVENT, header + (record or bytes(96)))
 
     async def _announcements(self) -> None:
         while True:

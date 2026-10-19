@@ -7,7 +7,7 @@ import socket
 
 from .data_types import CommandEnum, DataPacket, DiscoveredDevice
 from .device import EvseDevice
-from .protocol import ZERO_SERIAL, build_packet, parse_device_info
+from .protocol import ZERO_SERIAL, build_packet, parse_device_info, split_frames
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +161,10 @@ class EvseListener:
         self.sendto(build_packet(CommandEnum.LOGIN_REQUEST, None, None), (broadcast_addr, port))
 
     def _on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        for frame in split_frames(data):
+            self._on_frame(frame, addr)
+
+    def _on_frame(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
             packet = DataPacket(data)
         except ValueError as e:
@@ -219,7 +223,7 @@ class EvseListener:
             if info:
                 discovered.brand = info.brand
                 discovered.model = info.model
-                discovered.hardware_version = info.hardware_version
+                discovered.firmware_version = info.firmware_version
                 discovered.max_amps = info.max_amps
         log.info("Discovered EVSE %s at %s:%d", serial, addr[0], addr[1])
         try:

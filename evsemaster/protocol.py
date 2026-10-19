@@ -3,17 +3,22 @@
 import logging
 import struct
 import zoneinfo
-from datetime import datetime
+from datetime import datetime, time
 
 from .data_types import (
     ENVELOPE_SIZE,
     HEADER,
     TAIL,
+    Action,
+    ChargeRecord,
     ChargingStatus,
     CommandEnum,
     DataPacket,
     EvseDeviceInfo,
     EvseStatus,
+    FaultEnum,
+    WeeklyPlan,
+    WeeklyPlanSlot,
     now_aware,
 )
 
@@ -21,6 +26,9 @@ log = logging.getLogger(__name__)
 
 ZERO_SERIAL = "0000000000000000"
 SHANGHAI_TZ = zoneinfo.ZoneInfo("Asia/Shanghai")
+WEEKLY_PLAN_SIZE = 64
+SLOT_ON = 3
+SLOT_OFF = 1
 
 
 def shanghai_offset() -> int:
@@ -29,6 +37,19 @@ def shanghai_offset() -> int:
     local_offset = now.utcoffset().total_seconds()
     shanghai = now.replace(tzinfo=SHANGHAI_TZ).utcoffset().total_seconds()
     return int(shanghai - local_offset)
+
+
+def split_frames(data: bytes) -> list[bytes]:
+    """Split a datagram into frames; an EC311S at times sends a reply and the next frame in one datagram."""
+    frames = []
+    while True:
+        declared = int.from_bytes(data[2:4]) if len(data) >= 4 else 0
+        rest = data[declared:]
+        if declared < ENVELOPE_SIZE or not rest.startswith(HEADER.to_bytes(2)):
+            frames.append(data)
+            return frames
+        frames.append(data[:declared])
+        data = rest
 
 
 def build_packet(cmd: CommandEnum, serial: str | None, password: str | None, payload: bytes = b"") -> bytes:
@@ -116,11 +137,21 @@ def parse_device_info(packet: DataPacket) -> EvseDeviceInfo | None:
         type=packet.get_int(0, 1),
         brand=packet.get_string(1, 16),
         model=packet.get_string(17, 16),
-        hardware_version=packet.get_string(33, 16),
+        firmware_version=packet.get_string(33, 16),
         max_power=packet.get_int(49, 4),
         max_amps=packet.get_int(53, 1),
         serial_number=packet.device_serial,
     )
+
+
+def parse_faults(error_bits: int) -> list[FaultEnum]:
+    """Name every fault set in the status error field, lowest number first."""
+    faults = []
+    for fault in FaultEnum:
+        # fault 0 is the most significant bit of the 32
+        if error_bits & (1 << (31 - fault)):
+            faults.append(fault)
+    return faults
 
 
 def parse_status(packet: DataPacket) -> EvseStatus | None:
@@ -140,7 +171,7 @@ def parse_status(packet: DataPacket) -> EvseStatus | None:
         plug_state=packet.get_int(18, 1),
         output_state=packet.get_int(19, 1),
         current_state=packet.get_int(20, 1),
-        errors=packet.get_int(21, 4),
+        faults=parse_faults(packet.get_int(21, 4)),
         l2_voltage=packet.read_measurement(25, 2, 10) if three_phase else 0.0,
         l2_amps=packet.read_measurement(27, 2, 100) if three_phase else 0.0,
         l3_voltage=packet.read_measurement(29, 2, 10) if three_phase else 0.0,
@@ -181,3 +212,66 @@ def parse_charging_status(packet: DataPacket, epoch_to_datetime) -> ChargingStat
         fee_type=packet.get_int(71, 1),
         charge_fee=packet.get_int(72, 2) / 100,
     )
+
+
+def parse_charge_record(packet: DataPacket, offset: int, epoch_to_datetime) -> ChargeRecord | None:
+    """Parse a charge record at offset: 0 in 0x0009/0x000A, 9 in a 0x000C history reply."""
+    if packet.length() < offset + 88:
+        return None
+
+    def moment(field: int) -> datetime | None:
+        raw = packet.get_int(offset + field, 4)
+        return None if raw in (0, 0xFFFFFFFF) else epoch_to_datetime(raw)
+
+    max_minutes = packet.get_int(offset + 52, 2)
+    max_energy = packet.get_int(offset + 54, 2)
+    return ChargeRecord(
+        line_id=packet.get_int(offset, 1),
+        started_by=packet.get_string(offset + 1, 16),
+        stopped_by=packet.get_string(offset + 17, 16),
+        charge_id=packet.get_string(offset + 33, 16),
+        has_reservation=packet.get_int(offset + 49, 1) == 1,
+        start_type=packet.get_int(offset + 50, 1),
+        charge_type=packet.get_int(offset + 51, 1),
+        max_duration_minutes=None if max_minutes in (0, 65535) else max_minutes,
+        max_energy_kwh=None if max_energy == 65535 else max_energy / 100,
+        stop_reason=packet.get_int(offset + 58, 1),
+        reservation_datetime=moment(60),
+        start_datetime=moment(64),
+        stop_datetime=moment(68),
+        duration_seconds=packet.get_int(offset + 72, 4),
+        start_kwh_counter=packet.get_int(offset + 76, 4) / 100,
+        stop_kwh_counter=packet.get_int(offset + 80, 4) / 100,
+        charge_kwh=packet.get_int(offset + 84, 4) / 100,
+    )
+
+
+def build_record_ack(packet: DataPacket) -> bytes:
+    """Acknowledge a 0x0009/0x000A record by its charge id; byte 0 is the constant 1 the app sends."""
+    return bytes([1]) + packet.get_buffer(33, 16) + bytes([1])
+
+
+def parse_weekly_plan(packet: DataPacket) -> WeeklyPlan | None:
+    """Parse a 0x010E reply; like the app, any slot state but 1 counts as on."""
+    if packet.length() < WEEKLY_PLAN_SIZE:
+        return None
+    slots = []
+    for day in range(7):
+        base = 1 + 9 * day
+        slots.append(
+            WeeklyPlanSlot(
+                enabled=packet.get_int(base, 1) != SLOT_OFF,
+                start=time(packet.get_int(base + 1, 1), packet.get_int(base + 2, 1)),
+                duration_minutes=packet.get_int(base + 3, 2),
+            )
+        )
+    return WeeklyPlan(slots=slots)
+
+
+def build_weekly_plan_payload(plan: WeeklyPlan) -> bytes:
+    """Build a 0x810E set; every slot is written, with the unlimited limit the app sends."""
+    payload = bytearray([Action.SET])
+    for slot in plan.slots:
+        state = SLOT_ON if slot.enabled else SLOT_OFF
+        payload += struct.pack(">BBBHI", state, slot.start.hour, slot.start.minute, slot.duration_minutes, 0xFFFFFFFF)
+    return bytes(payload)

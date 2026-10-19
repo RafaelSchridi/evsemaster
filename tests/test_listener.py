@@ -156,6 +156,19 @@ async def test_a_wifi_config_reply_never_logs_its_passphrase(listener, caplog, s
     assert b"hunter2".hex() not in caplog.text
 
 
+async def test_a_frame_behind_another_in_one_datagram_is_handled(listener):
+    """An EC311S sent a heading with a status frame behind it; the status was lost."""
+    device = await listener.async_add_device("127.0.0.1", "123456")
+    heading = build_packet(CommandEnum.HEADING_EVENT, SERIAL_A, "")
+    status = build_packet(CommandEnum.CURRENT_STATUS_EVENT, SERIAL_A, "", status_payload())
+
+    listener._on_datagram(heading + status, ("127.0.0.1", 21937))
+    await asyncio.sleep(0)
+
+    assert device.last_heading is not None
+    assert device.get_latest_status() is not None
+
+
 async def test_a_packet_we_cannot_parse_is_dropped_quietly(listener, discovered):
     listener._on_datagram(b"\xff\xff not an evse packet at all", ("10.0.0.5", 7248))
     listener._on_datagram(b"", ("10.0.0.5", 7248))

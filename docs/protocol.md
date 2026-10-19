@@ -14,6 +14,10 @@ Sources, as used in the **Source** column:
   unit: 21937, 30139 and 46540 have been seen.
 - The client sends unicast to the charger's IP and port. Learn both from any packet the charger sends.
 - Replies always go to port 28376, whatever port the request came from.
+- **One datagram can hold several frames.** An EC311S sent a heading with a status frame behind it, and a weekly plan
+  set reply with the get reply behind it. Split by each frame's declared length.
+- **An all-`FF` frame** (command `0xFFFF`, 12-byte payload) at times arrives where a reply was due: once for `0x800D`
+  in the post-login burst, once during a history read. Drop it.
 
 ## Frame
 
@@ -101,8 +105,10 @@ get charging status (`0x8006`), charge fee, service fee, maneuver, language, out
 | 49 | 4 | max power |
 | 53 | 1 | max amps |
 
-An EC311S sends 119 bytes. From byte 54 it carries `TELESTAR-DIGITAL` and `GmbH`, not decoded. Its hardware version
-here, `25.1651.114C0933`, is not the string [Version](#version-0x8106--0x0106) returns.
+An EC311S sends 119 bytes. From byte 54 it carries `TELESTAR-DIGITAL` and `GmbH`, not decoded.
+
+Bytes 33–48 are what the app's About page labels **"Firmware version"** (`25.1651.114C0933` on an EC311S). It is not
+the string [Version](#version-0x8106--0x0106) returns, which the app never shows.
 
 ### Status (`0x0004`, `0x000D`)
 
@@ -155,9 +161,9 @@ Status bytes 21–24, read as a u32.
 error bytes to a binary string and takes `indexOf("1")` as the fault number, so it reports only the lowest-numbered
 fault that is set. emproto's reading of bit *n* is wrong.
 
-The app has two paths: bytes 21–22 alone, as a 16-bit string, for firmware with a 2-byte error field, and bytes
-21–24 as a 32-bit string otherwise. Both number faults from the most significant bit, so faults 0–15 sit in bytes
-21–22 either way.
+The app picks the width by payload length alone (`singleACStatus`): under 25 bytes it reads bytes 21–22 as a 16-bit
+string, otherwise bytes 21–24. Both number faults from the most significant bit, so faults 0–15 sit in bytes 21–22
+either way. The app has no names for faults 16–23.
 
 ### Charging status (`0x0005`, `0x0006`)
 
@@ -270,8 +276,13 @@ duration and energy limits apply whatever the charge type: `Fix Time` ends charg
 | 17 | `Pull Plug` | cable unplugged |
 | 255 | `Power Down` | power loss |
 
-**Acknowledgement** `0x8009` / `0x800A`, 18 bytes: `[line id, charge id (16), 1]`. The charge id is the one from
-the record. Without it, the charger resends the `0x000A` record every few seconds.
+`0x0009` arrives within a second of a session ending, including a reservation cancelled by a stop or by unplugging.
+A record nobody acknowledges joins the `0x000A` replay. A charge started by the weekly plan records charge type 2 and
+the window's length as its max duration.
+
+**Acknowledgement** `0x8009` / `0x800A`, 18 bytes: `[1, charge id (16), 1]`. The app writes byte 0 as a constant `1`,
+not the record's line id, and acknowledges every record unconditionally. Without it, the charger resends the `0x000A`
+record every few seconds.
 
 ### History (`0x800B`, `0x800C`)
 
@@ -280,8 +291,8 @@ slot order and wrap, so the newest overwrites the oldest.
 
 - **Count:** `0x800B [0x01]` → `0x000B`, 13 bytes: `[byte, capacity u32, a u32, b u32]`.
   - The app reads only bytes 1–4 and treats them as the record count, but they hold the capacity: 300.
-  - `a + b` is always the capacity. Acknowledging a `0x000A` record moves one from `b` to `a`, and a new record adds
-    one to `b`. That fits `b` = records not yet acknowledged and `a` = the rest.
+  - `a + b` is always the capacity, and `b` is the number of records not yet acknowledged: acknowledging the whole
+    replay backlog took it from 69 to 0.
   - Byte 0 read `00`, `ff` and `01` at different times. Meaning unknown.
 - **One record:** `0x800C [0x01, index u32]` → `0x000C`; bytes 0–3 are the capacity, bytes 4–7 echo the index,
   byte 8 is a flag, and a [charge record](#charge-record-0x0009-0x000a-and-0x000c-from-byte-9) starts at byte 9.
@@ -290,7 +301,7 @@ slot order and wrap, so the newest overwrites the oldest.
     an old record's bytes, others zeros, and a never-written slot is all `FF`. The app has no delete command, so what
     empties a slot is unknown.
 - **Pacing:** replies go missing even at a slow pace: 18 of 300 at four requests a second, 2 of 7 at one per 2.5 s.
-  Retry a read that gets no reply.
+  Retry a read that gets no reply. Four a second with retries read all 300 slots in 89 s (331 requests).
 
 Reading history changes nothing on the charger, and neither does acknowledging a `0x000A` record: slots 1–10 still
 held their records after the app acknowledged them. The app's history screen reads nothing from the charger; it lists
@@ -305,7 +316,11 @@ Empty request. Reply, 37 bytes; an EC311S returns `25.1651.114C09` for both vers
 | 0 | 16 | hardware version |
 | 16 | 16 | software version |
 | 32 | 4 | feature; the app shows it as "firmware signature" |
-| 36 | 1 | "supportNew" in the app; `0x0B` on an EC311S, so not a boolean |
+| 36 | 1 | "supportNew" in the app; `0x0B` on an EC311S, so not a boolean. The app stores it and never reads it |
+
+The app never displays either version string. The feature word is shown as "firmware signature" and sent with firmware
+update checks. It has one protocol effect: with feature word `0x554ABE8E`, the app ignores the electrical values in a
+`0x000D` status.
 
 ### One-value settings
 
@@ -319,6 +334,9 @@ Payload `[action, value]`. Get: `[2]`; emproto sends `[2, 0]`.
 
 Values are confirmed from the app for language and temperature unit. An EC311S answers all three gets: `02 10`
 (16 A), `02 01` (English) and `02 01` (°C).
+
+Language: the app gets with `[2, 0]` and sets with `[1, code]`. An EC311S echoes the new value in its set reply
+(`01 03`), a get right after already returns it, and its display switches language.
 
 ### Start method (`0x810D → 0x010D`)
 
@@ -367,25 +385,35 @@ Observed on an EC311S in January 2026, not since.
 
 - **Size:** always 64 bytes. Get: `[2]` followed by 63 zero bytes; an EC311S also answers a bare `[2]`. Set: `[1]`
   followed by 7 slots.
-- **Slots:** slot *i* starts at byte `1 + 9i`. Slot 0 is most likely Monday, since the app lists Mon–Sun.
+- **Slots:** slot *i* starts at byte `1 + 9i`. Slot 0 is Monday: the app maps its Mon–Sun list straight onto slots
+  0–6.
 
 | Offset in slot | Size | Field |
 |---|---|---|
 | 0 | 1 | state: `3` = on, `1` = off |
 | 1 | 1 | start hour |
 | 2 | 1 | start minute |
-| 3 | 2 | duration, probably minutes |
+| 3 | 2 | duration, minutes, 1–1440 |
 | 5 | 4 | limit; the app always sends `FFFFFFFF` |
 
 The app switches the whole plan off by setting every slot's state to `1`. The protocol holds a separate time for each
-day, even though the app's interface sets one time for all selected days.
+day, even though the app's interface sets one time for all selected days. The app computes the duration from a start
+and an end time: an end before the start runs into the next day, an equal one is 1440. Its parser counts any state but
+`1` as on; it only ever writes `1` and `3`.
+
+A set reply echoes the written plan, but one of two went missing on an EC311S. The app re-reads the plan 2 s after
+every set.
 
 An EC311S with the plan off returns `01 00 00 0000 00000000` for every slot: the limit reads `0` where the app writes
 `FFFFFFFF`.
 
 A start by the charger's own schedule shows in the charge record as start type 4, `Clock`, without a reservation. A
 slot is a window: plugging in during it starts a charge with the rest of the window as its max duration (plugged in
-at 12:28, 212 minutes, ended by `Fix Time` at 16:00).
+at 12:28, 212 minutes, ended by `Fix Time` at 16:00). A car already plugged in starts charging when the window opens.
+
+**A window overrides a reservation.** An EC311S accepts a reservation while a plan is on (result 1, even for a time
+inside a window). When a window opened with a reservation pending for the next day, it started the plan's charge, and
+once that ended the charger reported state 15, not 20: the reservation was gone, without a record of its own. Plugging in outside a window starts nothing.
 
 ### Fees (`0x8104 → 0x0104`, `0x8105 → 0x0105`)
 

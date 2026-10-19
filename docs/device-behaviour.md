@@ -89,8 +89,8 @@ by the retry, an inbound broadcast has usually revealed the real one.
 | `CURRENT_STATUS_EVENT` 0x0004 | `CURRENT_STATUS_RESPONSE` 0x8004 | - |
 | `LOGIN_SUCCESS_EVENT` 0x0002 | `LOGIN_CONFIRM_RESPONSE` 0x8001 | handshake never completes |
 | `CURRENT_CHARGING_STATUS_EVENT` 0x0005 | `CURRENT_CHARGING_STATUS_RESPONSE` 0x8005, payload `[0x00]` | unknown |
-| `CURRENT_CHARGE_RECORD_EVENT` 0x0009 | 0x8009, charge id acknowledgement | unknown |
-| `UPLOAD_LOCAL_CHARGE_RECORD` 0x000A | 0x800A, charge id acknowledgement | record is rebroadcast forever |
+| `CURRENT_CHARGE_RECORD_EVENT` 0x0009 | 0x8009, charge id acknowledgement | record joins the 0x000A replay |
+| `UPLOAD_LOCAL_CHARGE_RECORD_EVENT` 0x000A | 0x800A, charge id acknowledgement | record is rebroadcast forever |
 
 
 **The charger always answers to port 28376, never to the source port of the request.** A
@@ -108,14 +108,15 @@ Two further properties of this frame, both confirmed by measurement:
 
 ## Charging records
 
-When a session ends the charger uploads a record and **keeps rebroadcasting it until an app acknowledges it**. A charger that has never been acknowledged holds a backlog and replays it continuously - one record every few seconds, indefinitely.
+When a session ends the charger sends its record as 0x0009 within a second, and **keeps rebroadcasting it as 0x000A until an app acknowledges it**. A charger that has never been acknowledged holds a backlog and replays it continuously - one record every few seconds, indefinitely. Acknowledged, the next one follows within about 2 s: an EC311S drained a 71-record backlog in under 4 minutes.
 
 This does not affect the registration; an EC311S with over a hundred unacknowledged records reports telemetry normally.
 
 **Acknowledging takes a record out of the replay, not out of history.** The charger keeps its last 300 sessions in a
 ring that 0x800B/0x800C read, acknowledged or not. The vendor app, though, builds its history only from records it
 acknowledges itself and never reads the charger's. A client that acknowledges records therefore hides those sessions
-from the vendor app.
+from the vendor app. This library acknowledges every record, so the vendor app's history misses every session a
+client of this library saw first.
 
 ## Timings
 

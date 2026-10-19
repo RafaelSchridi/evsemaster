@@ -71,7 +71,11 @@ asyncio.run(main())
 ```
 
 Updates arrive through `on_event(event_type, data)`, where `event_type` is the model name:
-`"EvseStatus"`, `"ChargingStatus"` or `"EvseDeviceInfo"`.
+`"EvseStatus"`, `"ChargingStatus"`, `"EvseDeviceInfo"`, `"WeeklyPlan"` or `"ChargeRecord"`.
+
+A `ChargeRecord` arrives when a session ends, and the library acknowledges it so the charger stops rebroadcasting it.
+The EVSEMaster app lists only records it acknowledged itself, so it won't show sessions this library saw first.
+`await evse.read_history()` reads the charger's own store of its last 300 sessions, in about 90 seconds.
 
 ### Scheduling a session
 
@@ -111,12 +115,15 @@ successful login plus a packet other than an announcement within the last 120 se
 - Start/stop charging, including reservations with a start time and a duration
 - Get/set nickname
 - Get/set current limit, refused on models that silently ignore it mid-charge
+- Get/set the display language
+- Get/set the weekly plan, the charger's own recurring schedule
+- Fault names decoded from the status error bits
+- Finished-session records, acknowledged as they arrive, and the charger's session history
 - Device time, with correction for on-device clock drift
 
 ## Not planned
 
 - Home Assistant or MQTT integration, see [evsemaster-homeassistant](https://github.com/RafaelSchridi/evsemaster-homeassistant)
-- Recurring charge schedules; single reservations are covered by `start_charging`
 - Bluetooth setup (getting the charger onto wifi). The EVSEMaster app is unpleasant, but you only need
   it once.
 
