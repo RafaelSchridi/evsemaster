@@ -422,6 +422,33 @@ async def test_history_leaves_out_empty_slots(listener, listen_port, fast_reread
         evse.stop()
 
 
+async def test_a_nickname_goes_out_behind_the_acp_prefix(device, evse):
+    assert await device.login()
+    assert await until(lambda: device.get_latest_device_info().nickname == "Garage")
+    await device.set_nickname("Shed_2" + "x" * 22)
+    assert await until(lambda: evse.payloads[CommandEnum.NICKNAME_REQUEST][:1] == bytes([Action.SET]))
+    assert evse.payloads[CommandEnum.NICKNAME_REQUEST] == bytes([Action.SET]) + b"ACP#Shed_2" + b"x" * 22
+
+
+@pytest.mark.parametrize("nickname", ["Garage 2", "Garáž", "x" * 29])
+async def test_a_nickname_the_vendor_app_would_not_accept_is_refused(device, evse, nickname):
+    """The app's rename dialog lets through only letters, digits and _, in the 28 bytes after ACP#."""
+    assert await device.login()
+    with pytest.raises(ValueError):
+        await device.set_nickname(nickname)
+
+
+async def test_a_nickname_reads_back_as_utf8(listener, listen_port):
+    evse = await FakeEvse(SERIAL, nickname="Garáž", client_port=listen_port).start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456")
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        assert await until(lambda: device.get_latest_device_info().nickname == "Garáž")
+    finally:
+        evse.stop()
+
+
 async def test_language_is_read_at_login_and_reread_after_a_set(device, evse, fast_rereads):
     assert await device.login()
     assert await until(lambda: device.get_latest_device_info().language == LanguageEnum.ENGLISH)

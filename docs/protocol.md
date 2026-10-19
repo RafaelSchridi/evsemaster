@@ -41,7 +41,8 @@ A frame is 25 + n bytes. **All offsets below are payload offsets** (frame offset
 
 - `0x8xxx` goes from client to charger, `0x0xxx` from charger to client. A request `0x8xxx` gets the reply `0x0xxx`.
 - Set/get commands start with an action byte: `1` = set, `2` = get. The reply echoes it.
-- Strings are fixed width, ASCII, zero padded.
+- Strings are fixed width and zero padded. The app encodes and decodes every one as UTF-8; the chargers seen so far
+  send only ASCII.
 - Times are u32 epoch seconds calculated as if local time were Asia/Shanghai. The charger's clock drifts.
 - Line id is a connector number, always `1` so far.
 - The password is checked on every packet. Commands work without logging in.
@@ -350,7 +351,8 @@ ignores an empty request.
 
 ### Nickname (`0x8108 → 0x0108`)
 
-33 bytes: `[action, name (32)]`. Get: `[2]`. A name being set is prefixed with `ACP#`.
+33 bytes: `[action, name (32)]`. Get: `[2]`. A name being set is prefixed with `ACP#`, which leaves 28 bytes for the
+name. Replies carry the name without the prefix (wire). The app's rename dialog lets through only `[a-zA-Z0-9_]` ; what the charger's display does with anything else is untested.
 
 ### System time (`0x8101 → 0x0101`)
 

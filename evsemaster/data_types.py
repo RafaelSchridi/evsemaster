@@ -380,7 +380,8 @@ class DataPacket:
         null_pos = string_data.find(b"\x00")
         if null_pos >= 0:
             string_data = string_data[:null_pos]
-        return string_data.decode("ascii", errors="ignore")
+        # the vendor app decodes every string field as UTF-8
+        return string_data.decode("utf-8", errors="ignore")
 
     def get_buffer(self, offset: int, length: int = 1) -> bytes:
         """Read buffer from byte data."""

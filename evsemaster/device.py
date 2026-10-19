@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import re
 import struct
 from datetime import datetime, timedelta
 from typing import Any
@@ -63,6 +64,8 @@ HISTORY_PASSES = 4
 
 SETTING_REREAD_DELAY = 2  # set replies echo the new value but can go missing, so a get follows every set
 LANGUAGE_GET = bytes([Action.GET, 0])
+# what the vendor app's rename dialog lets through; the 32-byte field also holds an ACP# prefix
+NICKNAME_PATTERN = re.compile(r"[a-zA-Z0-9_]{0,28}")
 WEEKLY_PLAN_GET = bytes([Action.GET]) + bytes(WEEKLY_PLAN_SIZE - 1)  # the app's padding; an EC311S takes a bare [2]
 
 
@@ -461,18 +464,15 @@ class EvseDevice:
         if not self.is_authorised:
             raise NotLoggedInError("Please login before setting nickname")
 
-        max_display_nickname = 28
-        if len(nickname) > max_display_nickname:
-            log.warning(f"Nickname too long, truncating to {max_display_nickname} characters")
-            nickname = nickname[:max_display_nickname]
+        if not NICKNAME_PATTERN.fullmatch(nickname):
+            raise ValueError("A nickname is at most 28 letters, digits or underscores.")
 
         # Prepend "ACP#" prefix as required by the protocol
-        full_nickname = "ACP#" + nickname
+        full_nickname = ("ACP#" + nickname).encode("ascii")
 
         extra_payload = bytearray(33)
         struct.pack_into(">B", extra_payload, 0, Action.SET)
-        # Nickname (up to 20 bytes, ASCII encoded)
-        struct.pack_into(f">{len(full_nickname)}s", extra_payload, 1, full_nickname.encode("ascii"))
+        struct.pack_into(f">{len(full_nickname)}s", extra_payload, 1, full_nickname)
 
         self.send_command(CommandEnum.NICKNAME_REQUEST, extra_payload)
         return True
