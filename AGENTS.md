@@ -71,7 +71,8 @@ fixture; never bind 28376 in a test.
   firmware ignores zero-serial requests.
 - Charge records (0x0009, 0x000A) are acknowledged as they arrive, a user decision (2026-10-16): it ends the
   replay, but the vendor app lists only records it acknowledged itself, so it never shows those sessions.
-- One datagram can carry several frames; `split_frames` in the listener separates them. Replies also go missing,
+- One datagram can carry several frames; `split_frames` in the listener separates them. `DataPacket` drops a frame
+  with a bad tail or checksum, as the vendor app does. Replies also go missing,
   so a settings set is followed by a get (`_reread_later`), and history reads retry.
 - Per-model behaviour differences belong in `capabilities.py`, not in `if model ==` branches.
 

@@ -425,14 +425,14 @@ async def test_history_leaves_out_empty_slots(listener, listen_port, fast_reread
 async def test_a_nickname_goes_out_behind_the_acp_prefix(device, evse):
     assert await device.login()
     assert await until(lambda: device.get_latest_device_info().nickname == "Garage")
-    await device.set_nickname("Shed_2" + "x" * 22)
+    await device.set_nickname("Shed #2 (b)")
     assert await until(lambda: evse.payloads[CommandEnum.NICKNAME_REQUEST][:1] == bytes([Action.SET]))
-    assert evse.payloads[CommandEnum.NICKNAME_REQUEST] == bytes([Action.SET]) + b"ACP#Shed_2" + b"x" * 22
+    assert evse.payloads[CommandEnum.NICKNAME_REQUEST] == (bytes([Action.SET]) + b"ACP#Shed #2 (b)").ljust(33, b"\0")
 
 
-@pytest.mark.parametrize("nickname", ["Garage 2", "Garáž", "x" * 29])
-async def test_a_nickname_the_vendor_app_would_not_accept_is_refused(device, evse, nickname):
-    """The app's rename dialog lets through only letters, digits and _, in the 28 bytes after ACP#."""
+@pytest.mark.parametrize("nickname", ["Garáž", "x" * 12, "tab\there"])
+async def test_a_nickname_the_charger_would_not_show_is_refused(device, evse, nickname):
+    """An EC311S refuses names over 11 characters, and its display leaves non-ASCII characters blank."""
     assert await device.login()
     with pytest.raises(ValueError):
         await device.set_nickname(nickname)

@@ -1,13 +1,12 @@
 """Packet codec and payload parsing."""
 
-import logging
 import struct
 from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
 from evsemaster import CommandEnum, DataPacket, FaultEnum, StartTypeEnum, StopReasonEnum, WeeklyPlan, WeeklyPlanSlot
-from evsemaster.data_types import HEADER, TAIL, _mismatched, now_aware
+from evsemaster.data_types import HEADER, TAIL, now_aware
 from evsemaster.protocol import (
     build_packet,
     build_record_ack,
@@ -96,20 +95,13 @@ def test_fee_replies_are_known_commands():
     assert packet(CommandEnum(0x0105), bytes.fromhex("01010000")).command is CommandEnum.SERVICE_FEE_EVENT
 
 
-def test_a_bad_checksum_is_logged_but_the_packet_is_kept(caplog):
-    """UDP already checksums every datagram; this only tells us whether chargers ever disagree."""
+def test_a_frame_with_a_bad_checksum_is_dropped():
+    """The vendor app drops it too."""
     raw = bytearray(build_packet(CommandEnum.HEADING_EVENT, SERIAL, "123456", b"\x01"))
     raw[21] ^= 0xFF  # payload byte, so the checksum no longer covers it
-    _mismatched.discard(CommandEnum.HEADING_EVENT)  # warned once per command, for the life of the process
 
-    with caplog.at_level(logging.DEBUG, logger="evsemaster.data_types"):
-        packet = DataPacket(bytes(raw))
+    with pytest.raises(ValueError, match="checksum"):
         DataPacket(bytes(raw))
-
-    mismatches = [r for r in caplog.records if "mismatch" in r.getMessage()]
-    assert packet.command is CommandEnum.HEADING_EVENT, "a bad checksum must not cost the packet"
-    assert sum(r.levelno == logging.WARNING for r in mismatches) == 1, "a mismatching charger does it every packet"
-    assert sum(r.levelno == logging.DEBUG for r in mismatches) == 2, "debug logging must show every occurrence"
 
 
 def test_a_datagram_carrying_two_frames_is_split():

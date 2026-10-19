@@ -13,8 +13,6 @@ ENVELOPE_SIZE = 25
 HEADER = 0x0601
 TAIL = 0x0F02
 
-_mismatched: set[CommandEnum] = set()
-
 
 def now_aware() -> datetime:
     """Get the current datetime with timezone info."""
@@ -316,22 +314,6 @@ class WeeklyPlan(BaseSchema):
     slots: list[WeeklyPlanSlot] = Field(min_length=7, max_length=7)
 
 
-def _log_mismatch(command: CommandEnum, checksum: int, tail: int, declared: int, received: int) -> None:
-    """Every occurrence at debug; the first per command at warning."""
-    log.debug(
-        "Checksum/tail mismatch on %s: checksum %#06x, tail %#06x, declared %d bytes, received %d",
-        command.name,
-        checksum,
-        tail,
-        declared,
-        received,
-    )
-    if command in _mismatched:
-        return
-    _mismatched.add(command)
-    log.warning("Checksum/tail mismatch on %s, please report it with your charger model", command.name)
-
-
 class DataPacket:
     """Class for incoming data with unpack functions."""
 
@@ -361,9 +343,12 @@ class DataPacket:
         # Payload only: drop the 21 byte header and the trailing checksum + tail
         self.data = data[21 : end - 4]
         checksum, tail = unpack(">HH", data[end - 4 : end])
-        # log only for now, no rejection
+        # the vendor app drops these too
         if tail != TAIL or checksum != sum(data[: end - 4]) % 0xFFFF:
-            _log_mismatch(self.command, checksum, tail, declared, len(data))
+            raise ValueError(
+                f"Bad tail or checksum on {self.command.name}: checksum {checksum:#06x}, tail {tail:#06x}, "
+                f"declared {declared} bytes, received {len(data)}"
+            )
         log.debug(self.__repr__())
 
     def __repr__(self):

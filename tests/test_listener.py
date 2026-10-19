@@ -169,6 +169,19 @@ async def test_a_frame_behind_another_in_one_datagram_is_handled(listener):
     assert device.get_latest_status() is not None
 
 
+async def test_a_bad_frame_does_not_take_the_frame_behind_it(listener):
+    device = await listener.async_add_device("127.0.0.1", "123456")
+    heading = bytearray(build_packet(CommandEnum.HEADING_EVENT, SERIAL_A, ""))
+    heading[-3] ^= 1
+    status = build_packet(CommandEnum.CURRENT_STATUS_EVENT, SERIAL_A, "", status_payload())
+
+    listener._on_datagram(bytes(heading) + status, ("127.0.0.1", 21937))
+    await asyncio.sleep(0)
+
+    assert device.last_heading is None
+    assert device.get_latest_status() is not None
+
+
 async def test_a_packet_we_cannot_parse_is_dropped_quietly(listener, discovered):
     listener._on_datagram(b"\xff\xff not an evse packet at all", ("10.0.0.5", 7248))
     listener._on_datagram(b"", ("10.0.0.5", 7248))

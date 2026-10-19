@@ -64,8 +64,8 @@ HISTORY_PASSES = 4
 
 SETTING_REREAD_DELAY = 2  # set replies echo the new value but can go missing, so a get follows every set
 LANGUAGE_GET = bytes([Action.GET, 0])
-# what the vendor app's rename dialog lets through; the 32-byte field also holds an ACP# prefix
-NICKNAME_PATTERN = re.compile(r"[a-zA-Z0-9_]{0,28}")
+# an EC311S refuses a longer name, and its display leaves anything outside printable ASCII blank
+NICKNAME_PATTERN = re.compile(r"[ -~]{0,11}")
 WEEKLY_PLAN_GET = bytes([Action.GET]) + bytes(WEEKLY_PLAN_SIZE - 1)  # the app's padding; an EC311S takes a bare [2]
 
 
@@ -465,7 +465,7 @@ class EvseDevice:
             raise NotLoggedInError("Please login before setting nickname")
 
         if not NICKNAME_PATTERN.fullmatch(nickname):
-            raise ValueError("A nickname is at most 28 letters, digits or underscores.")
+            raise ValueError("A nickname is at most 11 printable ASCII characters.")
 
         # Prepend "ACP#" prefix as required by the protocol
         full_nickname = ("ACP#" + nickname).encode("ascii")

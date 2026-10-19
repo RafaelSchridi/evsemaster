@@ -27,6 +27,8 @@ Behaviour:
   sessions this library saw first are missing from the app's history.
 - `FakeEvse` answers `STATUS_REQUEST` and `CHARGING_STATUS_REQUEST` instead of 0x0004, and reports its own clock
   (`clock_skew`) instead of echoing the time it was sent.
+- `DataPacket` raises `ValueError` for a frame with a bad tail or checksum, instead of parsing it.
+- `set_nickname()` raises `ValueError` for a name over 11 characters or outside printable ASCII; 2.x cut it at 28.
 
 ## 2.0.3
 

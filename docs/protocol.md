@@ -14,8 +14,9 @@ Sources, as used in the **Source** column:
   unit: 21937, 30139 and 46540 have been seen.
 - The client sends unicast to the charger's IP and port. Learn both from any packet the charger sends.
 - Replies always go to port 28376, whatever port the request came from.
-- **One datagram can hold several frames.** An EC311S sent a heading with a status frame behind it, and a weekly plan
-  set reply with the get reply behind it. Split by each frame's declared length.
+- **One datagram can hold several frames**, usually a reply with a push or heading behind it. Split by each frame's
+  declared length. No frame has been seen spanning two datagrams.
+- Drop a frame with a bad tail or checksum, as the vendor app does.
 - **An all-`FF` frame** (command `0xFFFF`, 12-byte payload) at times arrives where a reply was due: once for `0x800D`
   in the post-login burst, once during a history read. Drop it.
 
@@ -351,8 +352,10 @@ ignores an empty request.
 
 ### Nickname (`0x8108 → 0x0108`)
 
-33 bytes: `[action, name (32)]`. Get: `[2]`. A name being set is prefixed with `ACP#`, which leaves 28 bytes for the
-name. Replies carry the name without the prefix (wire). The app's rename dialog lets through only `[a-zA-Z0-9_]` ; what the charger's display does with anything else is untested.
+33 bytes: `[action, name (32)]`. Get: `[2]`. A name being set is prefixed with `ACP#`; replies carry it without.
+A set reply starts with `01` when the name was taken, or `00` and the old name when it was refused.
+
+At most 11 characters; the charger refuses a longer name. Its display shows printable ASCII only.
 
 ### System time (`0x8101 → 0x0101`)
 
