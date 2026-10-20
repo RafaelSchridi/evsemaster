@@ -75,7 +75,10 @@ Updates arrive through `on_event(event_type, data)`, where `event_type` is the m
 
 A `ChargeRecord` arrives when a session ends, and the library acknowledges it so the charger stops rebroadcasting it.
 The EVSEMaster app lists only records it acknowledged itself, so it won't show sessions this library saw first.
-`await evse.read_history()` reads the charger's own store of its last 300 sessions, in about 90 seconds.
+`await evse.read_history()` reads the charger's own store of its last 300 sessions. The charger does not say which of
+its 300 slots holds the newest session, so every read asks for all of them, one at a time, which takes a few minutes.
+It returns a `ChargeHistory`: `records` keyed by slot, and `unread_slots`, the slots that never answered after retries.
+A session in an unread slot is missing from `records`.
 
 ### Scheduling a session
 

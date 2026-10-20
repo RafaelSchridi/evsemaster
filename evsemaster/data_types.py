@@ -302,6 +302,13 @@ class ChargeRecord(BaseSchema):
     charge_kwh: float
 
 
+class ChargeHistory(BaseSchema):
+    """A read of the history ring: records by slot, and the slots that never answered, whose sessions are missing."""
+
+    records: dict[int, ChargeRecord]
+    unread_slots: list[int]
+
+
 class WeeklyPlanSlot(BaseSchema):
     enabled: bool = False
     start: time = time(0, 0)

@@ -403,8 +403,29 @@ async def test_history_asks_again_for_replies_that_went_missing(listener, listen
         evse.drop_history_once = {2}
 
         history = await device.read_history()
-        assert {slot: record.charge_id for slot, record in history.items()} == {1: "a", 2: "b"}
+        assert {slot: record.charge_id for slot, record in history.records.items()} == {1: "a", 2: "b"}
+        assert history.unread_slots == []
         assert evse.received.count(CommandEnum.HISTORY_RECORD_REQUEST) == 6, "slot 2 is asked twice, the rest once"
+    finally:
+        evse.stop()
+
+
+async def test_history_names_the_slots_that_never_answered(listener, listen_port, fast_rereads):
+    evse = await FakeEvse(
+        SERIAL,
+        client_port=listen_port,
+        history_capacity=3,
+        history={1: charge_record_payload("a"), 2: charge_record_payload("b")},
+    ).start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456")
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        evse.drop_history_always = {2}
+
+        history = await device.read_history()
+        assert list(history.records) == [1]
+        assert history.unread_slots == [2]
     finally:
         evse.stop()
 
@@ -417,7 +438,9 @@ async def test_history_leaves_out_empty_slots(listener, listen_port, fast_reread
         device = await listener.async_add_device("127.0.0.1", "123456")
         assert await until(lambda: device.serial is not None)
         assert await device.login()
-        assert list(await device.read_history()) == [3]
+        history = await device.read_history()
+        assert list(history.records) == [3]
+        assert history.unread_slots == [], "an empty slot answered, so it was read"
     finally:
         evse.stop()
 

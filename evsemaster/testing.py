@@ -145,6 +145,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         self.history_capacity = history_capacity
         # history requests the fake leaves unanswered once, as a real charger loses some
         self.drop_history_once: set[int] = set()
+        self.drop_history_always: set[int] = set()
         self.received: list[CommandEnum] = []
         self.payloads: dict[CommandEnum, bytes] = {}
         self.amps_set: list[int] = []
@@ -266,6 +267,8 @@ class FakeEvse(asyncio.DatagramProtocol):
             self.send(CommandEnum.HISTORY_COUNT_EVENT, struct.pack(">BIII", 0, self.history_capacity, 0, 0))
         elif cmd == CommandEnum.HISTORY_RECORD_REQUEST:
             index = struct.unpack(">I", payload[1:5])[0]
+            if index in self.drop_history_always:
+                return
             if index in self.drop_history_once:
                 self.drop_history_once.discard(index)
                 return

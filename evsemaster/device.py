@@ -12,6 +12,7 @@ from .capabilities import Capabilities
 from .capabilities import for_device as capabilities_for
 from .data_types import (
     Action,
+    ChargeHistory,
     ChargeRecord,
     ChargingStatus,
     CommandEnum,
@@ -529,8 +530,8 @@ class EvseDevice:
             SETTING_REREAD_DELAY, self.send_command, cmd, payload
         )
 
-    async def read_history(self) -> dict[int, ChargeRecord]:
-        """Read every record in the charger's history ring, keyed by slot; takes about 90 s."""
+    async def read_history(self) -> ChargeHistory:
+        """Read every slot of the charger's history ring; takes a few minutes."""
         if not self.is_authorised:
             raise NotLoggedInError("Please login before reading history")
         async with self._history_lock:
@@ -548,7 +549,10 @@ class EvseDevice:
                         break
                 if missing:
                     log.warning("No history reply for %d of %d slots from %s", len(missing), capacity, self)
-                return {index: record for index, record in self._history.items() if record}
+                return ChargeHistory(
+                    records={index: record for index, record in self._history.items() if record},
+                    unread_slots=missing,
+                )
             finally:
                 self._history = None
 
