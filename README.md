@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/evsemaster)](https://pypi.org/project/evsemaster/)
 [![Python](https://img.shields.io/pypi/pyversions/evsemaster)](https://pypi.org/project/evsemaster/)
 [![CI](https://github.com/RafaelSchridi/evsemaster/actions/workflows/ci.yaml/badge.svg)](https://github.com/RafaelSchridi/evsemaster/actions/workflows/ci.yaml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/RafaelSchridi/evsemaster/blob/main/LICENSE)
 
 Unofficial Async Python client for EVSE chargers that speak the EVSEMaster app's UDP protocol, as used by
 Besen, Telestar, evseODM, Morec, Deltacom and other rebrands of the same hardware.
