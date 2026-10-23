@@ -14,3 +14,6 @@ dist/
 .env
 # Captures from tools/capture.py
 *.jsonl
+
+.coverage
+.coverage.*

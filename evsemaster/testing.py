@@ -146,6 +146,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         # history requests the fake leaves unanswered once, as a real charger loses some
         self.drop_history_once: set[int] = set()
         self.drop_history_always: set[int] = set()
+        self.ignored: set[CommandEnum] = set()
         self.received: list[CommandEnum] = []
         self.payloads: dict[CommandEnum, bytes] = {}
         self.amps_set: list[int] = []
@@ -226,6 +227,8 @@ class FakeEvse(asyncio.DatagramProtocol):
         payload = data[21:-4]
         self.payloads[cmd] = payload
 
+        if cmd in self.ignored:
+            return
         if cmd == CommandEnum.LOGIN_REQUEST:
             if data[13:19].decode(errors="ignore") != self.password:
                 self.send(CommandEnum.PASSWORD_ERROR_EVENT)

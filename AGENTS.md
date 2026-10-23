@@ -20,7 +20,7 @@ Three companion docs carry detail this file deliberately does not repeat:
 
 - Install: `poetry install`
 - Lint/format: `poetry run ruff check` / `poetry run ruff format` (line-length 120)
-- Test: `poetry run pytest`, or `poe check` for lint + tests
+- Test: `poetry run pytest`, or `poe check` for lint + tests; `poe cov` for branch coverage
 - Real hardware: `poe evse`, which reads `EVSE=<host>:<password>` from the gitignored `.env`, or
   `poetry run python test.py <host>:<password> [...]`. An interactive shell accepting shortcuts
   (`status`, `start`, `stop`, `discover`, `use <n>`, `all`) or `<command> [hex payload]`, where the

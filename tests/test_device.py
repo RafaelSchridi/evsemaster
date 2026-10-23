@@ -430,6 +430,22 @@ async def test_history_names_the_slots_that_never_answered(listener, listen_port
         evse.stop()
 
 
+async def test_history_gives_up_when_the_count_never_answers(listener, listen_port, fast_rereads):
+    evse = await FakeEvse(SERIAL, client_port=listen_port, history={1: charge_record_payload()}).start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456")
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        evse.ignored = {CommandEnum.HISTORY_COUNT_REQUEST}
+
+        with pytest.raises(TimeoutError):
+            await device.read_history()
+        assert evse.received.count(CommandEnum.HISTORY_COUNT_REQUEST) == device_module.HISTORY_PASSES
+        assert CommandEnum.HISTORY_RECORD_REQUEST not in evse.received
+    finally:
+        evse.stop()
+
+
 async def test_history_leaves_out_empty_slots(listener, listen_port, fast_rereads):
     evse = await FakeEvse(
         SERIAL, client_port=listen_port, history_capacity=4, history={3: charge_record_payload()}
