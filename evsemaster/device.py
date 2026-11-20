@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import struct
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from typing import Any
 
 from .capabilities import Capabilities
@@ -34,12 +34,13 @@ from .protocol import (
     build_start_charging_payload,
     build_stop_charging_payload,
     build_weekly_plan_payload,
+    datetime_to_device_epoch,
+    device_epoch_to_datetime,
     parse_charge_record,
     parse_charging_status,
     parse_device_info,
     parse_status,
     parse_weekly_plan,
-    shanghai_offset,
 )
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class EvseDevice:
         host_ip: str,
         password: str,
         on_event: callable | None = None,
+        tz: tzinfo | None = None,
     ):
         self.host = host
         self.host_ip = host_ip
@@ -88,6 +90,7 @@ class EvseDevice:
         self.serial: str | None = None
         self.user_id = "evsemasterpy"  # Do all actions as this "user"
         self.on_event = on_event
+        self.tz = tz
         self._listener = listener
         self._status: EvseStatus | None = None
         self._device_info: EvseDeviceInfo | None = None
@@ -347,7 +350,7 @@ class EvseDevice:
         device_epoch = packet.get_int(1, 4)
         if not device_epoch:
             return
-        delta = device_epoch + shanghai_offset() - int(now_aware().timestamp())
+        delta = device_epoch - datetime_to_device_epoch(now_aware(), self.tz)
         log.debug("Device clock is %+d s from ours (epoch %d)", delta, device_epoch)
         if abs(delta) <= CLOCK_SKEW_THRESHOLD:
             if self._time_delta:
@@ -434,6 +437,7 @@ class EvseDevice:
             start_date = now_aware()
         elif start_date.tzinfo is None:
             raise ValueError("start_date must be timezone aware datetime")
+        start_date = start_date.astimezone(self.tz)
         if not duration_minutes or duration_minutes < 1 or duration_minutes > 65535:
             duration_minutes = 65535
         if not max_amps:
@@ -573,9 +577,6 @@ class EvseDevice:
         """Set the EVSE device's internal clock.
 
         dt: datetime to set (defaults to current time)
-
-        The device stores time in a weird way - we need to calculate the offset
-        between local timezone and Shanghai timezone and apply it to the timestamp.
         """
         if not self.is_authorised:
             raise NotLoggedInError("Please login before setting device time")
@@ -603,7 +604,7 @@ class EvseDevice:
         apply_epoch_adjustment: If True, applies a calculated time delta workaround of now + the time
         the device itself thinks it is (31 days offset as of Jan 2026)
         """
-        epoch = int(dt.timestamp() - shanghai_offset())
+        epoch = datetime_to_device_epoch(dt, self.tz)
 
         # FIRMWARE BUG WORKAROUND: add time delta if calculated and requested
         if self._time_delta != 0 and apply_epoch_adjustment:
@@ -617,14 +618,14 @@ class EvseDevice:
         Convert EVSE timestamp to local datetime.
         The EVSE stores timestamps as if they were in Shanghai timezone.
         """
-        epoch = evse_epoch_time + shanghai_offset()
+        epoch = evse_epoch_time
 
         # FIRMWARE BUG WORKAROUND: subtract time delta if calculated and out of sync by more than 1 day
         if self._time_delta != 0 and evse_epoch_time - int(now_aware().timestamp()) > 86400:
             epoch -= self._time_delta
             log.debug(f"Applied time delta workaround: adjusted epoch by -{self._time_delta} seconds")
 
-        return datetime.fromtimestamp(epoch, tz=now_aware().tzinfo)
+        return device_epoch_to_datetime(epoch, self.tz)
 
     def get_latest_device_info(self) -> EvseDeviceInfo | None:
         """Get the latest device info."""

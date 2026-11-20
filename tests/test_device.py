@@ -1,8 +1,10 @@
 """Session behaviour of one device, against a fake EVSE on loopback."""
 
 import asyncio
+import calendar
 import struct
-from datetime import time, timedelta
+import zoneinfo
+from datetime import datetime, time, timedelta
 
 import pytest
 
@@ -20,11 +22,18 @@ from evsemaster import (
 from evsemaster import device as device_module
 from evsemaster.data_types import CurrentStateEnum, UnsupportedOperationError
 from evsemaster.device import HEADING_TIMEOUT
-from evsemaster.protocol import shanghai_offset
+from evsemaster.protocol import datetime_to_device_epoch
 from evsemaster.testing import FakeEvse, charge_record_payload, charging_payload, device_info_payload
 
 SERIAL = "aa" * 8
 MONTH = 31 * 86400
+AMSTERDAM = zoneinfo.ZoneInfo("Europe/Amsterdam")
+SHANGHAI_HOURS = 8 * 3600
+
+
+def wall_epoch(*wall) -> int:
+    """What the charger stores for a wall time: that time read as Asia/Shanghai."""
+    return calendar.timegm((*wall, 0)) - SHANGHAI_HOURS
 
 
 async def until(predicate, seconds=5.0):
@@ -288,7 +297,54 @@ async def test_a_schedule_is_aimed_at_the_chargers_own_clock(device, evse):
     assert await device.start_charging(start_date=start)
     assert await until(lambda: CommandEnum.CHARGE_START_REQUEST in evse.payloads)
     start_epoch = struct.unpack_from(">I", evse.payloads[CommandEnum.CHARGE_START_REQUEST], 34)[0]
-    assert start_epoch == int(start.timestamp()) - shanghai_offset() + MONTH
+    assert start_epoch == datetime_to_device_epoch(start) + MONTH
+
+
+@pytest.mark.parametrize("wall", [(2026, 7, 1, 5, 0), (2026, 1, 15, 5, 0)], ids=["summer", "winter"])
+async def test_a_time_across_a_dst_switch_keeps_its_wall_time(device, system_zone, wall):
+    """A 05:00 reservation planned before the 2026-10-25 switch fired at 06:00."""
+    system_zone("Europe/Amsterdam")
+    local = datetime(*wall, tzinfo=AMSTERDAM)
+
+    assert device._datetime_to_shanghai_epoch(local) == wall_epoch(*wall)
+    assert device._shanghai_epoch_to_datetime(wall_epoch(*wall)) == local
+
+
+async def test_the_device_zone_wins_over_the_system_zone(listener, evse, system_zone):
+    system_zone("UTC")
+    device = await listener.async_add_device("127.0.0.1", "123456", tz=AMSTERDAM)
+
+    assert device._datetime_to_shanghai_epoch(datetime(2026, 7, 1, 3, 0, tzinfo=zoneinfo.ZoneInfo("UTC"))) == (
+        wall_epoch(2026, 7, 1, 5, 0)
+    )
+    read = device._shanghai_epoch_to_datetime(wall_epoch(2026, 7, 1, 5, 0))
+    assert read == datetime(2026, 7, 1, 5, 0, tzinfo=AMSTERDAM)
+    assert read.utcoffset() == timedelta(hours=2)
+
+
+async def test_a_charger_in_the_device_zone_shows_no_skew(listener, listen_port, system_zone):
+    system_zone("Asia/Tokyo")
+    evse = await FakeEvse(SERIAL, client_port=listen_port, tz=AMSTERDAM, nickname="Garage").start()
+    try:
+        device = await listener.async_add_device("127.0.0.1", "123456", tz=AMSTERDAM)
+        assert await until(lambda: device.serial is not None)
+        assert await device.login()
+        assert await until(lambda: device.get_latest_device_info().nickname == "Garage")
+        assert device.time_delta == 0
+    finally:
+        evse.stop()
+
+
+async def test_a_schedule_is_written_in_the_device_zone(listener, evse):
+    device = await listener.async_add_device("127.0.0.1", "123456", tz=AMSTERDAM)
+    assert await until(lambda: device.serial is not None)
+    assert await device.login()
+
+    start = (now_aware() + timedelta(hours=2)).astimezone(zoneinfo.ZoneInfo("UTC"))
+    assert await device.start_charging(start_date=start)
+    assert await until(lambda: CommandEnum.CHARGE_START_REQUEST in evse.payloads)
+    payload = evse.payloads[CommandEnum.CHARGE_START_REQUEST]
+    assert payload[17:29].decode() == start.astimezone(AMSTERDAM).strftime("%Y%m%d%H%M")
 
 
 async def test_a_single_phase_charger_reports_status(listener):

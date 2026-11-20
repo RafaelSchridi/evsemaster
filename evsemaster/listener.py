@@ -4,6 +4,7 @@ import asyncio
 import errno
 import logging
 import socket
+from datetime import tzinfo
 
 from .data_types import CommandEnum, DataPacket, DiscoveredDevice
 from .device import EvseDevice
@@ -117,14 +118,16 @@ class EvseListener:
             except TimeoutError:
                 log.debug("Timed out waiting for the socket to close")
 
-    async def async_add_device(self, host: str, password: str, on_event: callable | None = None) -> EvseDevice:
-        """Register a device by host; the serial is learned from its first packet."""
+    async def async_add_device(
+        self, host: str, password: str, on_event: callable | None = None, tz: tzinfo | None = None
+    ) -> EvseDevice:
+        """Register a device by host; tz is the charger's zone, the system zone if None."""
         loop = asyncio.get_running_loop()
         infos = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM)
         host_ip = infos[0][4][0]
         if host_ip in self._by_ip:
             raise DeviceAlreadyRegistered(self._by_ip[host_ip])
-        device = EvseDevice(self, host=host, host_ip=host_ip, password=password, on_event=on_event)
+        device = EvseDevice(self, host=host, host_ip=host_ip, password=password, on_event=on_event, tz=tz)
         self._by_ip[host_ip] = device
         log.debug("Registered %s", device)
         return device

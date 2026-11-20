@@ -3,7 +3,7 @@
 import logging
 import struct
 import zoneinfo
-from datetime import datetime, time
+from datetime import UTC, datetime, time, timezone, tzinfo
 
 from .data_types import (
     ENVELOPE_SIZE,
@@ -31,12 +31,23 @@ SLOT_ON = 3
 SLOT_OFF = 1
 
 
-def shanghai_offset() -> int:
-    """Offset between the local timezone and Shanghai timezone in seconds."""
-    now = now_aware()
-    local_offset = now.utcoffset().total_seconds()
-    shanghai = now.replace(tzinfo=SHANGHAI_TZ).utcoffset().total_seconds()
-    return int(shanghai - local_offset)
+def datetime_to_device_epoch(dt: datetime, tz: tzinfo | None = None) -> int:
+    """Charger timestamp for dt: its wall time in tz (the system zone if None), labelled Asia/Shanghai."""
+    # via UTC: astimezone() into dt's own zone does nothing, and would keep a wall time a spring switch skips
+    local = dt.astimezone(UTC).astimezone(tz)
+    wall_as_shanghai = local.replace(tzinfo=SHANGHAI_TZ)
+    return int(wall_as_shanghai.timestamp())
+
+
+def device_epoch_to_datetime(epoch: int, tz: tzinfo | None = None) -> datetime:
+    """Datetime for a charger timestamp, with the UTC offset tz (the system zone if None) has at that time."""
+    wall_as_shanghai = datetime.fromtimestamp(epoch, SHANGHAI_TZ)
+    wall = wall_as_shanghai.replace(tzinfo=None)
+    if tz is None:
+        return wall.astimezone()
+    local = wall.replace(tzinfo=tz).astimezone(UTC).astimezone(tz)
+    # a fixed offset, as astimezone() gives: Python subtracts and compares datetimes sharing a ZoneInfo by wall time
+    return local.astimezone(timezone(local.utcoffset()))
 
 
 def split_frames(data: bytes) -> list[bytes]:

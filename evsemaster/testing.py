@@ -12,11 +12,11 @@ logins, keeps a session alive with headings, and records what it received.
 
 import asyncio
 import struct
-import time
+from datetime import tzinfo
 
-from .data_types import Action, CommandEnum
+from .data_types import Action, CommandEnum, now_aware
 from .listener import LISTEN_PORT
-from .protocol import build_packet, shanghai_offset
+from .protocol import build_packet, datetime_to_device_epoch
 
 
 def device_info_payload(brand: str = "BESEN", model: str = "BS20", max_amps: int = 32) -> bytes:
@@ -121,6 +121,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         language: int = 1,
         history: dict[int, bytes] | None = None,
         history_capacity: int = 300,
+        tz: tzinfo | None = None,
     ):
         self.serial = serial
         self.password = password
@@ -137,6 +138,7 @@ class FakeEvse(asyncio.DatagramProtocol):
         self.announce_interval = announce_interval
         self.heading_interval = heading_interval
         self.clock_skew = clock_skew
+        self.tz = tz
         self.errors = errors
         self.language = language
         # every slot off, as an EC311S reports a plan nobody set
@@ -249,7 +251,7 @@ class FakeEvse(asyncio.DatagramProtocol):
             self.send(CommandEnum.CHARGING_STATUS_EVENT, charging_payload())
         elif cmd == CommandEnum.SYSTEM_TIME_REQUEST:
             # reports its own clock even right after a set, as a skewed charger did in January 2026
-            clock = int(time.time()) - shanghai_offset() + self.clock_skew
+            clock = datetime_to_device_epoch(now_aware(), self.tz) + self.clock_skew
             self.send(CommandEnum.SYSTEM_TIME_EVENT, struct.pack(">BI", payload[0] if payload else Action.GET, clock))
         elif cmd == CommandEnum.NICKNAME_REQUEST:
             self.send(CommandEnum.NICKNAME_EVENT, bytes([Action.GET]) + self.nickname.encode() + b"\x00")

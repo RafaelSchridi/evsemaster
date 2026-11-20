@@ -362,6 +362,9 @@ At most 11 characters; the charger refuses a longer name. Its display shows prin
 `[action, time u32]`. Get: `[2]`. The reply carries the charger's clock.
 
 The time sent is the local wall clock read as if it were UTC, minus 28800 (8 h). Reading is the exact inverse.
+The charger keeps wall time only, so the hour a DST switch repeats is ambiguous. The library reads it as the first
+pass (`fold=0`). A time that a spring switch skips is written as the wall time of the same instant, after the switch
+(02:30 becomes 03:30 in Europe).
 
 The app writes the clock after login and again after every heading response, roughly every 10 s. It never reads it
 back: `0x0101` has no handler in its dispatcher, so the reply layout is emproto's.

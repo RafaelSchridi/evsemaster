@@ -80,6 +80,10 @@ fixture; never bind 28376 in a test.
 
 - The EVSE interprets all timestamps as Asia/Shanghai local time; convert with
   `_datetime_to_shanghai_epoch` / `_shanghai_epoch_to_datetime` on the device.
+- Convert through wall time in the charger's zone (`EvseDevice.tz`, the system zone if `None`), never with a UTC
+  offset taken from now: that is 1 h off across a DST switch.
+- Datetimes read from the charger carry a fixed UTC offset, not a `ZoneInfo`. Python subtracts and compares two
+  datetimes that share a `ZoneInfo` by wall time, which is wrong across a switch. `tests/test_clock.py` covers both.
 - Nothing corrects the device clock on its own, so a charger no client has ever set can be weeks out.
   `set_device_time` runs on every login for that reason.
 - **A charger can run a month ahead and act on it**, and writing the clock does not clear it — the set reply comes
